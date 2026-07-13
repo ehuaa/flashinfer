@@ -669,7 +669,17 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
     }
 
     __syncthreads();
-    smem_t<KTraits::SWIZZLE_MODE_P> p_smem(smem_storage->kpe_p_smem[stage_idx].p);
+    // The P all-gather scratch aliases kpe_p_smem[stage].p, which is a union
+    // with the raw KPE storage. On the FP8 path the pipelined prefetch issues
+    // load_kv into that same union (.kpe) concurrently with this PV stage, so
+    // writing P there would race with the in-flight cp.async. The KPE BF16
+    // staging buffer is already consumed by QK and idle during PV, and has the
+    // exact same size (HEAD_DIM_KPE == CTA_TILE_Q), so reuse it for P instead.
+    typename KTraits::DTypeQ* p_base =
+        KTraits::USE_KV_REPACK ? reinterpret_cast<typename KTraits::DTypeQ*>(
+                                     &smem_storage->kpe_bf16_smem[0])
+                               : smem_storage->kpe_p_smem[stage_idx].p;
+    smem_t<KTraits::SWIZZLE_MODE_P> p_smem(p_base);
     constexpr uint32_t UPCAST_STRIDE_P = KTraits::UPCAST_STRIDE_P;
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
@@ -1137,6 +1147,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
         repack_fp8_kv_to_bf16<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant.ckv_scale,
                                        variant.kpe_scale);
         __syncthreads();
+        // FP8 only: QK/PV read the BF16 staging buffers, so the raw FP8 stage
+        // buffer is free the instant repack finishes (the __syncthreads above
+        // also guarantees all threads are done reading it). Issue the next
+        // tile's cp.async now so the DMA overlaps this tile's QK/PV, and skip
+        // the separate pre-load __syncthreads the BF16 path needs.
+        if (kv_tile_idx - NUM_STAGES >= 0) {
+          load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
+                           kpe_stride_n, kpe_stride_page, packed_kv_bound,
+                           block_iter_base + (kv_tile_idx - NUM_STAGES) * CTA_TILE_KV, block_size,
+                           (kv_tile_idx - NUM_STAGES) % NUM_STAGES);
+          cp_async::commit_group();
+        }
       }
 
       // compute mla qk
@@ -1153,13 +1175,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       // compute sfm * v
       compute_mla_pv<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag, d, o_frag);
 
-      if (kv_tile_idx - NUM_STAGES >= 0) {
-        __syncthreads();
-        load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
-                         kpe_stride_n, kpe_stride_page, packed_kv_bound,
-                         block_iter_base + (kv_tile_idx - NUM_STAGES) * CTA_TILE_KV, block_size,
-                         (kv_tile_idx - NUM_STAGES) % NUM_STAGES);
-        cp_async::commit_group();
+      if constexpr (!KTraits::USE_KV_REPACK) {
+        if (kv_tile_idx - NUM_STAGES >= 0) {
+          __syncthreads();
+          load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
+                           kpe_stride_n, kpe_stride_page, packed_kv_bound,
+                           block_iter_base + (kv_tile_idx - NUM_STAGES) * CTA_TILE_KV, block_size,
+                           (kv_tile_idx - NUM_STAGES) % NUM_STAGES);
+          cp_async::commit_group();
+        }
       }
     }
 
@@ -1174,6 +1198,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
         repack_fp8_kv_to_bf16<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant.ckv_scale,
                                        variant.kpe_scale);
         __syncthreads();
+        // FP8 only: prefetch now (the raw FP8 buffer is free after repack) so
+        // the cp.async overlaps this tile's QK/PV. See the masked loop above.
+        load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
+                         kpe_stride_n, kpe_stride_page, packed_kv_bound,
+                         block_iter_base + (kv_tile_idx - NUM_STAGES) * CTA_TILE_KV, block_size,
+                         (kv_tile_idx - NUM_STAGES) % NUM_STAGES);
+        cp_async::commit_group();
       }
 
       // compute mla qk
@@ -1185,12 +1216,14 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       // compute sfm * v
       compute_mla_pv<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag, d, o_frag);
 
-      __syncthreads();
-      load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
-                       kpe_stride_n, kpe_stride_page, packed_kv_bound,
-                       block_iter_base + (kv_tile_idx - NUM_STAGES) * CTA_TILE_KV, block_size,
-                       (kv_tile_idx - NUM_STAGES) % NUM_STAGES);
-      cp_async::commit_group();
+      if constexpr (!KTraits::USE_KV_REPACK) {
+        __syncthreads();
+        load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
+                         kpe_stride_n, kpe_stride_page, packed_kv_bound,
+                         block_iter_base + (kv_tile_idx - NUM_STAGES) * CTA_TILE_KV, block_size,
+                         (kv_tile_idx - NUM_STAGES) % NUM_STAGES);
+        cp_async::commit_group();
+      }
     }
     cp_async::wait_group<0>();
     __syncthreads();
