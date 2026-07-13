@@ -1151,8 +1151,7 @@ def test_fp8_kv_kpe_dominant_no_row_aliasing(backend):
     +100 for the BF16 baseline. If the FP8 path silently aliases KPE
     row 4 with row 8, the output flips toward 0 or -100.
     """
-    if not is_sm90a_supported(torch.device("cuda")):
-        pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
+    _skip_if_fp8_mla_unsupported(backend)
     torch.manual_seed(0)
     device = torch.device("cuda:0")
     B, ql, kl, H = 1, 1, 64, 16
