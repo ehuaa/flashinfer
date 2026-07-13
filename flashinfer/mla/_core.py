@@ -1616,18 +1616,30 @@ class BatchMLAPagedAttentionWrapper:
                 f"Supported dtypes: {list(_SUPPORTED_MLA_KV_DTYPES)}."
             )
         if kv_data_type == torch.float8_e4m3fn:
-            if self._backend != "fa3":
-                raise ValueError(
-                    "FP8 kv_data_type for MLA is only supported with the fa3 "
-                    f"backend on SM90, got backend={self._backend!r}."
-                )
-            # Backend selection is independent of the runtime device; FP8 MLA
-            # requires SM90 specifically.
+            # Backend selection is independent of the runtime device, so check
+            # the (backend, device) combination explicitly.
             major, minor = get_compute_capability(self.device)
-            if major != 9:
+            if self._backend == "fa3":
+                if major != 9:
+                    raise ValueError(
+                        "FP8 kv_data_type for MLA with the fa3 backend requires "
+                        f"an SM90 (Hopper) device, got SM{major}{minor}."
+                    )
+            elif self._backend == "fa2":
+                # The fa2 FP8 path dequantizes KV to BF16 in shared memory and
+                # needs >= 152064B of smem per SM (see DISPATCH_SMEM_CONFIG in
+                # mla.cuh): SM80 (164KB) and SM90 (228KB) qualify; SM86/SM89
+                # (100KB) do not.
+                if not ((major == 8 and minor == 0) or major == 9):
+                    raise ValueError(
+                        "FP8 kv_data_type for MLA with the fa2 backend requires "
+                        "an SM80 (A100) or SM90 device (SM86/SM89 lack the "
+                        f"required shared memory), got SM{major}{minor}."
+                    )
+            else:
                 raise ValueError(
-                    "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
-                    f"got SM{major}{minor}."
+                    "FP8 kv_data_type for MLA is only supported with the fa2 "
+                    f"(SM80/SM90) or fa3 (SM90) backends, got backend={self._backend!r}."
                 )
             # Removing this guard exposes vec_cast<half, fp8_e4m3>, which
             # exists but is untested for MLA — silent wrong output.
@@ -1636,7 +1648,8 @@ class BatchMLAPagedAttentionWrapper:
                     "FP8 kv_data_type for MLA currently only supports "
                     f"q_data_type=torch.bfloat16, got {q_data_type}."
                 )
-            # Also enforced by static_assert in mla_hopper.cuh.
+            # Also enforced by static_assert in mla_hopper.cuh (fa3) and
+            # mla.cuh (fa2).
             if head_dim_ckv != 512 or head_dim_kpe != 64:
                 raise ValueError(
                     "FP8 kv_data_type for MLA currently only supports "
@@ -1790,8 +1803,8 @@ class BatchMLAPagedAttentionWrapper:
             Per-tensor dequantization scale for the compressed-KV cache when
             ``kv_data_type`` is FP8 (``real = quantized * ckv_scale``). Required
             (together with ``kpe_scale``) for the FP8 KV cache path on the
-            ``fa3`` backend. Must be a finite positive value. Must not be
-            provided when ``kv_data_type`` is BF16/FP16.
+            ``fa2`` and ``fa3`` backends. Must be a finite positive value. Must
+            not be provided when ``kv_data_type`` is BF16/FP16.
         kpe_scale : Optional[float]
             Per-tensor dequantization scale for the rope-K cache when
             ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``). Same
@@ -1806,8 +1819,8 @@ class BatchMLAPagedAttentionWrapper:
                 )
             if ckv_scale is not None or kpe_scale is not None:
                 raise ValueError(
-                    "ckv_scale / kpe_scale are only supported with the fa3 backend "
-                    "and FP8 kv_data_type."
+                    "ckv_scale / kpe_scale are only supported with the fa2/fa3 "
+                    "backends and FP8 kv_data_type."
                 )
             self._cached_module = get_mla_module()
             output_scale = 1.0

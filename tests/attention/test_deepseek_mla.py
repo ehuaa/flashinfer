@@ -28,6 +28,7 @@ from flashinfer.jit.attention import (
     gen_single_prefill_module,
 )
 from flashinfer.utils import (
+    get_compute_capability,
     has_flashinfer_jit_cache,
     is_sm90a_supported,
     is_sm100a_supported,
@@ -733,14 +734,26 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# FP8 KV cache path (DeepSeek MLA, fa3 / SM90 only). Stores KV as FP8 e4m3
-# in shared memory and dequants one tile at a time to BF16 right before WGMMA.
+# FP8 KV cache path (DeepSeek MLA; fa3 on SM90, fa2 on SM80/SM90). Stores KV
+# as FP8 e4m3 in shared memory and dequants one tile at a time to BF16 right
+# before the MMA (WGMMA on fa3, mma.sync on fa2).
 # Numerical reference: dequant the FP8 KV in Python (matching kernel layout)
 # and run the BF16 MLA path on the result; remaining diff is BF16 accumulation.
 # ───────────────────────────────────────────────────────────────────────────
 
 HEAD_DIM_CKV = 512
 HEAD_DIM_KPE = 64
+
+
+def _skip_if_fp8_mla_unsupported(backend: str):
+    """Mirror the (backend, device) support matrix enforced in plan()."""
+    major, minor = get_compute_capability(torch.device("cuda:0"))
+    if backend == "fa3":
+        if not is_sm90a_supported(torch.device("cuda")):
+            pytest.skip("FP8 KV MLA with the fa3 backend requires SM90a")
+    else:  # fa2
+        if not ((major == 8 and minor == 0) or major == 9):
+            pytest.skip("FP8 KV MLA with the fa2 backend requires SM80 or SM90")
 
 
 def _per_tensor_symmetric_quant_fp8(
@@ -806,6 +819,7 @@ def _run_mla(
     return wrapper.run(q_nope, q_pe, ckv, kpe, **kwargs)
 
 
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
 @pytest.mark.parametrize("kv_len", [256, 1024, 4096])
 @pytest.mark.parametrize("qo_len", [1, 16])
@@ -813,13 +827,12 @@ def _run_mla(
 @pytest.mark.parametrize("num_heads", [16, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_batch_mla_fp8_kv_matches_bf16_reference(
-    batch_size, kv_len, qo_len, page_size, num_heads, causal
+    backend, batch_size, kv_len, qo_len, page_size, num_heads, causal
 ):
     """For random FP8 KV with per-tensor scales, the FP8-KV kernel output
     must match the BF16 reference (run on the BF16-dequant of the same FP8
     data) within BF16 precision."""
-    if not is_sm90a_supported(torch.device("cuda")):
-        pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
+    _skip_if_fp8_mla_unsupported(backend)
     if causal and qo_len > kv_len:
         pytest.skip("invalid causal config (qo_len > kv_len)")
     if kv_len % page_size != 0:
@@ -870,7 +883,7 @@ def test_batch_mla_fp8_kv_matches_bf16_reference(
     sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
 
     o_bf16 = _run_mla(
-        "fa3",
+        backend,
         q_nope,
         q_pe,
         ckv_ref,
@@ -888,7 +901,7 @@ def test_batch_mla_fp8_kv_matches_bf16_reference(
     )
 
     o_fp8 = _run_mla(
-        "fa3",
+        backend,
         q_nope,
         q_pe,
         ckv_fp8,
@@ -924,9 +937,10 @@ def test_batch_mla_fp8_kv_matches_bf16_reference(
     )
 
 
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 @pytest.mark.parametrize("ckv_magnitude", [0.01, 0.1, 1.0])
 @pytest.mark.parametrize("kpe_magnitude", [0.01, 0.1, 1.0])
-def test_batch_mla_fp8_kv_scale_sensitivity(ckv_magnitude, kpe_magnitude):
+def test_batch_mla_fp8_kv_scale_sensitivity(backend, ckv_magnitude, kpe_magnitude):
     """The kernel must correctly apply per-tensor scales across orders of
     magnitude. We control the underlying data range, derive a realistic
     scale (max_abs / 448) per tensor, and verify both paths match.
@@ -934,8 +948,7 @@ def test_batch_mla_fp8_kv_scale_sensitivity(ckv_magnitude, kpe_magnitude):
     Q is normalized to keep softmax inputs bounded across the data range
     sweep; the kernel correctness (BF16 == FP8) is independent of softmax
     magnitudes."""
-    if not is_sm90a_supported(torch.device("cuda")):
-        pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
+    _skip_if_fp8_mla_unsupported(backend)
     torch.manual_seed(7)
     device = torch.device("cuda:0")
     batch_size, qo_len, kv_len = 2, 1, 256
@@ -993,7 +1006,7 @@ def test_batch_mla_fp8_kv_scale_sensitivity(ckv_magnitude, kpe_magnitude):
     sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
 
     o_bf16 = _run_mla(
-        "fa3",
+        backend,
         q_nope,
         q_pe,
         ckv_ref,
@@ -1010,7 +1023,7 @@ def test_batch_mla_fp8_kv_scale_sensitivity(ckv_magnitude, kpe_magnitude):
         kv_dtype=torch.bfloat16,
     )
     o_fp8 = _run_mla(
-        "fa3",
+        backend,
         q_nope,
         q_pe,
         ckv_fp8,
@@ -1047,12 +1060,12 @@ def test_batch_mla_fp8_kv_scale_sensitivity(ckv_magnitude, kpe_magnitude):
     )
 
 
-def test_batch_mla_fp8_kv_zero_kv_gives_zero_output():
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_batch_mla_fp8_kv_zero_kv_gives_zero_output(backend):
     """All-zero FP8 KV must produce all-zero attention output. Catches any
     BF16-staging buffer overflow from load_kv writing past its intended
     region (an earlier bug fixed by the dtype-aware inner-loop bounds)."""
-    if not is_sm90a_supported(torch.device("cuda")):
-        pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
+    _skip_if_fp8_mla_unsupported(backend)
     torch.manual_seed(0)
     device = torch.device("cuda:0")
     batch_size, qo_len, kv_len = 2, 1, 256
@@ -1100,7 +1113,7 @@ def test_batch_mla_fp8_kv_zero_kv_gives_zero_output():
     sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE)
 
     o = _run_mla(
-        "fa3",
+        backend,
         q_nope,
         q_pe,
         ckv_fp8,
@@ -1122,7 +1135,8 @@ def test_batch_mla_fp8_kv_zero_kv_gives_zero_output():
     assert o.abs().max().item() == 0.0, f"non-zero output: {o.abs().max().item()}"
 
 
-def test_fp8_kv_kpe_dominant_no_row_aliasing():
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_fp8_kv_kpe_dominant_no_row_aliasing(backend):
     """Deterministic regression for the FP8 KPE shmem swizzle aliasing bug.
 
     With HEAD_DIM_KPE=64 on the FP8 path, the raw KPE buffer has 4 b128
@@ -1166,7 +1180,7 @@ def test_fp8_kv_kpe_dominant_no_row_aliasing():
     kv_indices = torch.arange(0, nps, dtype=torch.int32, device=device)
 
     o_bf16 = _run_mla(
-        "fa3",
+        backend,
         q_nope,
         q_pe,
         ckv_ref,
@@ -1183,7 +1197,7 @@ def test_fp8_kv_kpe_dominant_no_row_aliasing():
         kv_dtype=torch.bfloat16,
     )
     o_fp8 = _run_mla(
-        "fa3",
+        backend,
         q_nope,
         q_pe,
         ckv_fp8,
@@ -1217,14 +1231,14 @@ def test_fp8_kv_kpe_dominant_no_row_aliasing():
     )
 
 
-def test_fp8_kv_plan_rejects_fp16_q():
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_fp8_kv_plan_rejects_fp16_q(backend):
     """FP8 KV MLA is BF16-Q only; FP16 Q must be rejected at plan() time
     with a clear ValueError."""
-    if not is_sm90a_supported(torch.device("cuda")):
-        pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
+    _skip_if_fp8_mla_unsupported(backend)
     device = torch.device("cuda:0")
     workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa3")
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend=backend)
     qo_indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
     kv_indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
     kv_indices = torch.tensor([0], dtype=torch.int32, device=device)
@@ -1262,6 +1276,7 @@ def test_fp8_kv_scales_are_keyword_only():
     )
 
 
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 @pytest.mark.parametrize(
     "wrong_tensor,wrong_dtype,exc_match",
     [
@@ -1271,13 +1286,12 @@ def test_fp8_kv_scales_are_keyword_only():
         ("kpe_cache", torch.bfloat16, "kpe_cache.dtype"),
     ],
 )
-def test_fp8_kv_run_rejects_dtype_mismatch(wrong_tensor, wrong_dtype, exc_match):
+def test_fp8_kv_run_rejects_dtype_mismatch(backend, wrong_tensor, wrong_dtype, exc_match):
     """The C++ launcher reinterprets tensor storage by the JIT-template type
     chosen at plan(); a run-time dtype mismatch produces silent wrong output.
     Each tensor (q_nope, q_pe, ckv_cache, kpe_cache) has an independent
     check; this test exercises all four."""
-    if not is_sm90a_supported(torch.device("cuda")):
-        pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
+    _skip_if_fp8_mla_unsupported(backend)
     device = torch.device("cuda:0")
     batch_size, qo_len, kv_len = 1, 1, 64
     page_size = 64
@@ -1327,7 +1341,7 @@ def test_fp8_kv_run_rejects_dtype_mismatch(wrong_tensor, wrong_dtype, exc_match)
     kv_indices = torch.tensor([0], dtype=torch.int32, device=device)
     kv_len_arr = torch.tensor([kv_len], dtype=torch.int32, device=device)
     workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa3")
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend=backend)
     wrapper.plan(
         qo_indptr,
         kv_indptr,
@@ -1353,11 +1367,11 @@ def test_fp8_kv_run_rejects_dtype_mismatch(wrong_tensor, wrong_dtype, exc_match)
         )
 
 
-def test_fp8_kv_requires_scales():
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_fp8_kv_requires_scales(backend):
     """Forgetting to pass ckv_scale / kpe_scale on the FP8 path should raise
     a clear error rather than silently producing wrong output."""
-    if not is_sm90a_supported(torch.device("cuda")):
-        pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
+    _skip_if_fp8_mla_unsupported(backend)
     torch.manual_seed(0)
     device = torch.device("cuda:0")
     batch_size, kv_len = 1, 64
@@ -1397,7 +1411,7 @@ def test_fp8_kv_requires_scales():
     kv_indices = torch.tensor([0], dtype=torch.int32, device=device)
     kv_len_arr = torch.tensor([kv_len], dtype=torch.int32, device=device)
     workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa3")
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend=backend)
     wrapper.plan(
         qo_indptr,
         kv_indptr,

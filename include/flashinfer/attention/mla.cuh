@@ -51,14 +51,33 @@ struct StandardAttention : AttentionVariantBase {
 template <uint32_t NUM_STAGES, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_CKV,
           uint32_t HEAD_DIM_KPE, typename DTypeQ, typename DTypeKV, typename DTypeO>
 struct SharedStorageQKVO {
+  // FP8 KV path: KV is stored as FP8 (e4m3) in shmem and dequantized into BF16
+  // staging buffers right before each MMA, because pre-SM89 has no FP8 tensor
+  // core instructions. Must match KernelTraits::USE_KV_REPACK exactly so the
+  // smem layout stays in sync with the kernel-side dequant.
+  static constexpr bool USE_KV_REPACK = std::is_same_v<DTypeKV, __nv_fp8_e4m3>;
   union {
     struct {
       alignas(16) DTypeQ q_smem_nope[CTA_TILE_Q * HEAD_DIM_CKV];
       alignas(16) DTypeQ q_smem_pe[CTA_TILE_Q * HEAD_DIM_KPE];
       alignas(16) DTypeKV ckv_smem[NUM_STAGES][CTA_TILE_KV * HEAD_DIM_CKV];
-      alignas(16) DTypeKV
-          kpe_p_smem[NUM_STAGES]
-                    [CTA_TILE_KV * (HEAD_DIM_KPE > CTA_TILE_Q ? HEAD_DIM_KPE : CTA_TILE_Q)];
+      // kpe is DTypeKV-typed while p (softmax output, reusing this storage in
+      // the PV stage) is always DTypeQ-typed so the PV MMA runs as 16-bit x
+      // 16-bit on the FP8 KV path. On the 16-bit KV path this union has the
+      // same size as the original CTA_TILE_KV * max(HEAD_DIM_KPE, CTA_TILE_Q)
+      // DTypeKV buffer.
+      union {
+        alignas(16) DTypeKV kpe[CTA_TILE_KV * HEAD_DIM_KPE];
+        alignas(16) DTypeQ p[CTA_TILE_KV * CTA_TILE_Q];
+      } kpe_p_smem[NUM_STAGES];
+      // FP8-only BF16 dequant staging, shared across stages: QK and PV of one
+      // KV tile both read it, and it is rebuilt for each tile between two
+      // __syncthreads() (see repack_fp8_kv_to_bf16 call sites). Collapses to a
+      // single element on the 16-bit KV path.
+      alignas(16) std::conditional_t<USE_KV_REPACK, DTypeQ[CTA_TILE_KV * HEAD_DIM_CKV],
+                                     DTypeQ[1]> ckv_bf16_smem;
+      alignas(16) std::conditional_t<USE_KV_REPACK, DTypeQ[CTA_TILE_KV * HEAD_DIM_KPE],
+                                     DTypeQ[1]> kpe_bf16_smem;
       union {
         alignas(16) float m_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
         alignas(16) float d_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
@@ -100,7 +119,36 @@ struct KernelTraits {
   static constexpr uint32_t UPCAST_STRIDE_CKV = HEAD_DIM_CKV / upcast_size<DTypeKV_>();
   static constexpr uint32_t UPCAST_STRIDE_KPE = HEAD_DIM_KPE / upcast_size<DTypeKV_>();
   static constexpr uint32_t UPCAST_STRIDE_FINAL_O = HEAD_DIM_CKV / upcast_size<DTypeO_>();
-  static constexpr uint32_t UPCAST_STRIDE_P = CTA_TILE_KV / upcast_size<DTypeKV_>();
+  // P (softmax output) is always DTypeQ-typed so the PV MMA runs as 16-bit x
+  // 16-bit on the FP8 KV path; on the 16-bit KV path DTypeQ == DTypeKV so this
+  // is unchanged.
+  static constexpr uint32_t UPCAST_STRIDE_P = CTA_TILE_KV / upcast_size<DTypeQ_>();
+
+  // FP8 KV path: KV stored as FP8 e4m3 in shmem, dequantized to DTypeQ before
+  // each MMA (pre-SM89 has no FP8 MMA). Match on the exact type (not
+  // sizeof == 1) so other 1-byte JIT dtypes don't silently take this path.
+  static constexpr bool USE_KV_REPACK = std::is_same_v<DTypeKV_, __nv_fp8_e4m3>;
+  // The FP8 load/dequant layout below is only derived for the DeepSeek MLA
+  // dims; JIT must not instantiate other sizes.
+  static_assert(!USE_KV_REPACK || (HEAD_DIM_CKV_ == 512 && HEAD_DIM_KPE_ == 64),
+                "FP8 KV MLA (fa2) currently only supports HEAD_DIM_CKV=512, HEAD_DIM_KPE=64");
+  // Strides for the DTypeQ-typed BF16 dequant staging buffers.
+  static constexpr uint32_t UPCAST_STRIDE_CKV_BF16 = HEAD_DIM_CKV / upcast_size<DTypeQ_>();
+  static constexpr uint32_t UPCAST_STRIDE_KPE_BF16 = HEAD_DIM_KPE / upcast_size<DTypeQ_>();
+  // Dtype-aware load_kv loop bounds. The 16-bit path hard-codes
+  // `NUM_MMA_D_* / 4` iterations of 8 lanes x b128, which overshoots by 2x for
+  // FP8 (one b128 holds 16 fp8 elems vs 8 bf16). For HEAD_DIM_KPE=64 on FP8
+  // the row only has 4 b128, so 4 of 8 lanes are additionally gated off.
+  static constexpr uint32_t LANES_PER_ROW_KPE = (UPCAST_STRIDE_KPE >= 8) ? 8 : UPCAST_STRIDE_KPE;
+  static constexpr uint32_t INNER_LOADS_CKV = UPCAST_STRIDE_CKV / 8;
+  static constexpr uint32_t INNER_LOADS_KPE = UPCAST_STRIDE_KPE / LANES_PER_ROW_KPE;
+  // Swizzle for the *raw* KPE shmem storage. When the row has fewer than 8
+  // b128 chunks (FP8 KPE with HEAD_DIM_KPE=64 has 4), the k128B swizzle's
+  // 8-column XOR pattern makes (row, col) and (row + 4, col) collide at the
+  // same shmem offset, corrupting load_kv writes; fall back to k64B. The
+  // 16-bit path (8 b128 per row) keeps k128B and is unchanged.
+  static constexpr SwizzleMode SWIZZLE_MODE_KPE_RAW =
+      (UPCAST_STRIDE_KPE < 8) ? SwizzleMode::k64B : SwizzleMode::k128B;
 
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
@@ -200,7 +248,10 @@ __device__ __forceinline__ void load_kv(
   const uint32_t warp_idx_in_wg = threadIdx.y;
 
   smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem(smem_storage->ckv_smem[stage_idx]);
-  smem_t<KTraits::SWIZZLE_MODE_KPE> kpe_smem(smem_storage->kpe_p_smem[stage_idx]);
+  // Raw KPE storage uses SWIZZLE_MODE_KPE_RAW (k64B on the FP8 path); it is
+  // only ever read back with the same swizzle (compute_mla_qk on the 16-bit
+  // path, repack_fp8_kv_to_bf16 on the FP8 path).
+  smem_t<KTraits::SWIZZLE_MODE_KPE_RAW> kpe_smem(smem_storage->kpe_p_smem[stage_idx].kpe);
 
   if constexpr (KTraits::NUM_MMA_KV == 1) {
     if (warpgroup_idx == 0) {
@@ -221,7 +272,7 @@ __device__ __forceinline__ void load_kv(
           r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
 
 #pragma unroll
-      for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 4; ++mma_d) {
+      for (uint32_t mma_d = 0; mma_d < KTraits::INNER_LOADS_CKV; ++mma_d) {
         uint32_t ckv_smem_offset_w = ckv_smem.template get_permuted_offset<UPCAST_STRIDE_CKV>(
             warp_idx_in_wg * 4 + lane_idx / 8, 8 * mma_d + lane_idx % 8);
         ckv_smem.load_128b_async<SharedMemFillMode::kFillZero>(ckv_smem_offset_w, ckv_ptr,
@@ -229,13 +280,16 @@ __device__ __forceinline__ void load_kv(
         ckv_ptr += 8 * upcast_size<DTypeKV>();
       }
 
+      // FP8 KPE rows only have 4 b128 chunks, so gate the extra lanes off.
+      if (lane_idx % 8 < KTraits::LANES_PER_ROW_KPE) {
 #pragma unroll
-      for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_KPE / 4; ++mma_d) {
-        uint32_t kpe_smem_offset_w = kpe_smem.template get_permuted_offset<UPCAST_STRIDE_KPE>(
-            warp_idx_in_wg * 4 + lane_idx / 8, 8 * mma_d + lane_idx % 8);
-        kpe_smem.load_128b_async<SharedMemFillMode::kFillZero>(kpe_smem_offset_w, kpe_ptr,
-                                                               packed_block_iter < packed_kv_bound);
-        kpe_ptr += 8 * upcast_size<DTypeKV>();
+        for (uint32_t mma_d = 0; mma_d < KTraits::INNER_LOADS_KPE; ++mma_d) {
+          uint32_t kpe_smem_offset_w = kpe_smem.template get_permuted_offset<UPCAST_STRIDE_KPE>(
+              warp_idx_in_wg * 4 + lane_idx / 8, 8 * mma_d + lane_idx % 8);
+          kpe_smem.load_128b_async<SharedMemFillMode::kFillZero>(
+              kpe_smem_offset_w, kpe_ptr, packed_block_iter < packed_kv_bound);
+          kpe_ptr += 8 * upcast_size<DTypeKV>();
+        }
       }
     }
   } else {
@@ -259,7 +313,7 @@ __device__ __forceinline__ void load_kv(
           r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
 
 #pragma unroll
-      for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 4; ++mma_d) {
+      for (uint32_t mma_d = 0; mma_d < KTraits::INNER_LOADS_CKV; ++mma_d) {
         uint32_t ckv_smem_offset_w = ckv_smem.template get_permuted_offset<UPCAST_STRIDE_CKV>(
             32 * mma_kv + warpgroup_idx * 16 + warp_idx_in_wg * 4 + lane_idx / 8,
             8 * mma_d + lane_idx % 8);
@@ -268,14 +322,17 @@ __device__ __forceinline__ void load_kv(
         ckv_ptr += 8 * upcast_size<DTypeKV>();
       }
 
+      // FP8 KPE rows only have 4 b128 chunks, so gate the extra lanes off.
+      if (lane_idx % 8 < KTraits::LANES_PER_ROW_KPE) {
 #pragma unroll
-      for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_KPE / 4; ++mma_d) {
-        uint32_t kpe_smem_offset_w = kpe_smem.template get_permuted_offset<UPCAST_STRIDE_KPE>(
-            32 * mma_kv + warpgroup_idx * 16 + warp_idx_in_wg * 4 + lane_idx / 8,
-            8 * mma_d + lane_idx % 8);
-        kpe_smem.load_128b_async<SharedMemFillMode::kFillZero>(kpe_smem_offset_w, kpe_ptr,
-                                                               packed_block_iter < packed_kv_bound);
-        kpe_ptr += 8 * upcast_size<DTypeKV>();
+        for (uint32_t mma_d = 0; mma_d < KTraits::INNER_LOADS_KPE; ++mma_d) {
+          uint32_t kpe_smem_offset_w = kpe_smem.template get_permuted_offset<UPCAST_STRIDE_KPE>(
+              32 * mma_kv + warpgroup_idx * 16 + warp_idx_in_wg * 4 + lane_idx / 8,
+              8 * mma_d + lane_idx % 8);
+          kpe_smem.load_128b_async<SharedMemFillMode::kFillZero>(
+              kpe_smem_offset_w, kpe_ptr, packed_block_iter < packed_kv_bound);
+          kpe_ptr += 8 * upcast_size<DTypeKV>();
+        }
       }
     }
   }
@@ -475,24 +532,105 @@ __device__ __forceinline__ void update_mdo_states_(typename KTraits::SharedStora
   }
 }
 
+// FP8 KV path: dequantize one tile of CKV/KPE from the packed FP8 shmem buffers
+// into the BF16 staging buffers, applying the per-tensor scales. The destination
+// uses the same k128B swizzle as the 16-bit KV path, so compute_mla_qk /
+// compute_mla_pv read the staging buffers with the standard 16-bit ldmatrix
+// logic. Same idiom as repack_fp8_tile_to_bf16 in prefill.cuh: each thread reads
+// one 16-byte chunk (16 FP8 elems) and writes two 16-byte chunks (8 x 16-bit
+// elems each). All 256 threads participate; the caller brackets this with
+// __syncthreads().
+template <typename KTraits>
+__device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedStorage* smem_storage,
+                                                      const uint32_t stage_idx,
+                                                      const float ckv_scale,
+                                                      const float kpe_scale) {
+  using DTypeKV = typename KTraits::DTypeKV;
+  using DTypeQ = typename KTraits::DTypeQ;
+  static_assert(std::is_same_v<DTypeKV, __nv_fp8_e4m3>,
+                "repack_fp8_kv_to_bf16 only supports DTypeKV == __nv_fp8_e4m3");
+  constexpr uint32_t NUM_THREADS = KTraits::NUM_THREADS;
+  constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
+  // b128 (16-byte) chunks per row in the packed FP8 layout.
+  constexpr uint32_t FP8_COLS_CKV = KTraits::UPCAST_STRIDE_CKV;
+  constexpr uint32_t FP8_COLS_KPE = KTraits::UPCAST_STRIDE_KPE;
+  constexpr uint32_t NUM_B128_CKV = CTA_TILE_KV * FP8_COLS_CKV;
+  constexpr uint32_t NUM_B128_KPE = CTA_TILE_KV * FP8_COLS_KPE;
+  const uint32_t thread_id = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
+
+  using packed2_t = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, nv_bfloat162>;
+  const packed2_t ckv_scale_packed{static_cast<DTypeQ>(ckv_scale),
+                                   static_cast<DTypeQ>(ckv_scale)};
+  const packed2_t kpe_scale_packed{static_cast<DTypeQ>(kpe_scale),
+                                   static_cast<DTypeQ>(kpe_scale)};
+
+  b128_t* src_ckv = (b128_t*)smem_storage->ckv_smem[stage_idx];
+  b128_t* dst_ckv = (b128_t*)smem_storage->ckv_bf16_smem;
+#pragma unroll
+  for (uint32_t idx = thread_id; idx < NUM_B128_CKV; idx += NUM_THREADS) {
+    const uint32_t row = idx / FP8_COLS_CKV, col = idx % FP8_COLS_CKV;
+    b128_t packed =
+        src_ckv[get_permuted_offset<KTraits::SWIZZLE_MODE_CKV, FP8_COLS_CKV>(row, col)];
+    alignas(16) DTypeQ conv[16];
+    vec_cast<DTypeQ, DTypeKV>::template cast<16>(conv, (DTypeKV*)&packed);
+#pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+      ((packed2_t*)conv)[k] = __hmul2(((packed2_t*)conv)[k], ckv_scale_packed);
+    }
+    dst_ckv[get_permuted_offset<KTraits::SWIZZLE_MODE_CKV, KTraits::UPCAST_STRIDE_CKV_BF16>(
+        row, 2 * col)] = *(b128_t*)&conv[0];
+    dst_ckv[get_permuted_offset<KTraits::SWIZZLE_MODE_CKV, KTraits::UPCAST_STRIDE_CKV_BF16>(
+        row, 2 * col + 1)] = *(b128_t*)&conv[8];
+  }
+
+  b128_t* src_kpe = (b128_t*)smem_storage->kpe_p_smem[stage_idx].kpe;
+  b128_t* dst_kpe = (b128_t*)smem_storage->kpe_bf16_smem;
+#pragma unroll
+  for (uint32_t idx = thread_id; idx < NUM_B128_KPE; idx += NUM_THREADS) {
+    const uint32_t row = idx / FP8_COLS_KPE, col = idx % FP8_COLS_KPE;
+    // Read side must use the raw (k64B) swizzle that load_kv wrote with; the
+    // write side uses the standard k128B layout expected by compute_qk_.
+    b128_t packed =
+        src_kpe[get_permuted_offset<KTraits::SWIZZLE_MODE_KPE_RAW, FP8_COLS_KPE>(row, col)];
+    alignas(16) DTypeQ conv[16];
+    vec_cast<DTypeQ, DTypeKV>::template cast<16>(conv, (DTypeKV*)&packed);
+#pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+      ((packed2_t*)conv)[k] = __hmul2(((packed2_t*)conv)[k], kpe_scale_packed);
+    }
+    dst_kpe[get_permuted_offset<KTraits::SWIZZLE_MODE_KPE, KTraits::UPCAST_STRIDE_KPE_BF16>(
+        row, 2 * col)] = *(b128_t*)&conv[0];
+    dst_kpe[get_permuted_offset<KTraits::SWIZZLE_MODE_KPE, KTraits::UPCAST_STRIDE_KPE_BF16>(
+        row, 2 * col + 1)] = *(b128_t*)&conv[8];
+  }
+}
+
 template <typename KTraits>
 __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* smem_storage,
                                                const uint32_t stage_idx,
                                                typename KTraits::DTypeQKAccum (*s_frag)[8]) {
   constexpr uint32_t UPCAST_STRIDE_Q_NOPE = KTraits::UPCAST_STRIDE_Q_NOPE;
   constexpr uint32_t UPCAST_STRIDE_Q_PE = KTraits::UPCAST_STRIDE_Q_PE;
-  constexpr uint32_t UPCAST_STRIDE_CKV = KTraits::UPCAST_STRIDE_CKV;
-  constexpr uint32_t UPCAST_STRIDE_KPE = KTraits::UPCAST_STRIDE_KPE;
   constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   smem_t<KTraits::SWIZZLE_MODE_Q_NOPE> q_smem_nope(smem_storage->q_smem_nope);
   smem_t<KTraits::SWIZZLE_MODE_Q_PE> q_smem_pe(smem_storage->q_smem_pe);
-  smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem(smem_storage->ckv_smem[stage_idx]);
-  smem_t<KTraits::SWIZZLE_MODE_KPE> kpe_smem(smem_storage->kpe_p_smem[stage_idx]);
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
-  compute_qk_</*init=*/true, KTraits, KTraits::NUM_MMA_D_KPE, KTraits::UPCAST_STRIDE_Q_PE,
-              KTraits::UPCAST_STRIDE_KPE>(q_smem_pe, kpe_smem, s_frag);
-  compute_qk_</*init=*/false, KTraits, KTraits::NUM_MMA_D_CKV, KTraits::UPCAST_STRIDE_Q_NOPE,
-              KTraits::UPCAST_STRIDE_CKV>(q_smem_nope, ckv_smem, s_frag);
+  if constexpr (KTraits::USE_KV_REPACK) {
+    // FP8 KV path: read the dequantized BF16 staging buffers with 16-bit strides.
+    smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem(smem_storage->ckv_bf16_smem);
+    smem_t<KTraits::SWIZZLE_MODE_KPE> kpe_smem(smem_storage->kpe_bf16_smem);
+    compute_qk_</*init=*/true, KTraits, KTraits::NUM_MMA_D_KPE, KTraits::UPCAST_STRIDE_Q_PE,
+                KTraits::UPCAST_STRIDE_KPE_BF16>(q_smem_pe, kpe_smem, s_frag);
+    compute_qk_</*init=*/false, KTraits, KTraits::NUM_MMA_D_CKV, KTraits::UPCAST_STRIDE_Q_NOPE,
+                KTraits::UPCAST_STRIDE_CKV_BF16>(q_smem_nope, ckv_smem, s_frag);
+  } else {
+    smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem(smem_storage->ckv_smem[stage_idx]);
+    smem_t<KTraits::SWIZZLE_MODE_KPE> kpe_smem(smem_storage->kpe_p_smem[stage_idx].kpe);
+    compute_qk_</*init=*/true, KTraits, KTraits::NUM_MMA_D_KPE, KTraits::UPCAST_STRIDE_Q_PE,
+                KTraits::UPCAST_STRIDE_KPE>(q_smem_pe, kpe_smem, s_frag);
+    compute_qk_</*init=*/false, KTraits, KTraits::NUM_MMA_D_CKV, KTraits::UPCAST_STRIDE_Q_NOPE,
+                KTraits::UPCAST_STRIDE_CKV>(q_smem_nope, ckv_smem, s_frag);
+  }
 }
 
 template <typename KTraits>
@@ -504,21 +642,34 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
   constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   constexpr uint32_t NUM_MMA_D_CKV = KTraits::NUM_MMA_D_CKV;
-  constexpr uint32_t UPCAST_STRIDE_CKV = KTraits::UPCAST_STRIDE_CKV;
-  smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem(smem_storage->ckv_smem[stage_idx]);
-  uint32_t ckv_smem_offset_r = ckv_smem.template get_permuted_offset<UPCAST_STRIDE_CKV>(
+  // On the FP8 KV path, V (= CKV) is read from the DTypeQ-typed BF16 dequant
+  // staging buffer; on the 16-bit path from the per-stage native buffer. Both
+  // use the same k128B swizzle, and the column indexing below is in 16-bit
+  // b128 units in both cases.
+  constexpr uint32_t UPCAST_STRIDE_V =
+      KTraits::USE_KV_REPACK ? KTraits::UPCAST_STRIDE_CKV_BF16 : KTraits::UPCAST_STRIDE_CKV;
+  smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem;
+  if constexpr (KTraits::USE_KV_REPACK) {
+    ckv_smem = smem_t<KTraits::SWIZZLE_MODE_CKV>(smem_storage->ckv_bf16_smem);
+  } else {
+    ckv_smem = smem_t<KTraits::SWIZZLE_MODE_CKV>(smem_storage->ckv_smem[stage_idx]);
+  }
+  uint32_t ckv_smem_offset_r = ckv_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
       lane_idx % 16, warpgroup_idx * NUM_MMA_D_CKV + lane_idx / 16);
   if constexpr (KTraits::QK_SHARD) {
     // shard s_frag computation on KV dimension across warpgroups, need allgather
-    alignas(16) typename KTraits::DTypeKV p_f16[NUM_MMA_KV / 2][8];
+    // P is always DTypeQ-typed (see SharedStorageQKVO) so the PV MMA runs as
+    // 16-bit x 16-bit on the FP8 KV path; on the 16-bit KV path DTypeQ ==
+    // DTypeKV so this is unchanged.
+    alignas(16) typename KTraits::DTypeQ p_f16[NUM_MMA_KV / 2][8];
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
-      vec_cast<typename KTraits::DTypeKV, float>::cast<8>(p_f16[mma_kv], s_frag[mma_kv]);
+      vec_cast<typename KTraits::DTypeQ, float>::cast<8>(p_f16[mma_kv], s_frag[mma_kv]);
       mma::m16k16_rowsum_f16f16f32(d, p_f16[mma_kv]);
     }
 
     __syncthreads();
-    smem_t<KTraits::SWIZZLE_MODE_P> p_smem(smem_storage->kpe_p_smem[stage_idx]);
+    smem_t<KTraits::SWIZZLE_MODE_P> p_smem(smem_storage->kpe_p_smem[stage_idx].p);
     constexpr uint32_t UPCAST_STRIDE_P = KTraits::UPCAST_STRIDE_P;
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
@@ -555,20 +706,21 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
       for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 2; ++mma_d) {
         uint32_t v_frag[4];
         ckv_smem.ldmatrix_m8n8x4_trans(ckv_smem_offset_r, v_frag);
-        mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeKV>(o_frag[mma_d], p_frag,
-                                                                             v_frag);
+        mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(o_frag[mma_d], p_frag,
+                                                                            v_frag);
         ckv_smem_offset_r = ckv_smem.template advance_offset_by_column<2>(ckv_smem_offset_r, mma_d);
       }
       ckv_smem_offset_r =
-          ckv_smem.template advance_offset_by_row<16, UPCAST_STRIDE_CKV>(ckv_smem_offset_r) -
+          ckv_smem.template advance_offset_by_row<16, UPCAST_STRIDE_V>(ckv_smem_offset_r) -
           NUM_MMA_D_CKV;
     }
   } else {
     // no need to store p_smem because all warpgroups are working on the same p
-    alignas(16) typename KTraits::DTypeKV p_f16[NUM_MMA_KV][8];
+    // P is always DTypeQ-typed; see the QK_SHARD branch above.
+    alignas(16) typename KTraits::DTypeQ p_f16[NUM_MMA_KV][8];
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
-      vec_cast<typename KTraits::DTypeKV, float>::cast<8>(p_f16[mma_kv], s_frag[mma_kv]);
+      vec_cast<typename KTraits::DTypeQ, float>::cast<8>(p_f16[mma_kv], s_frag[mma_kv]);
       mma::m16k16_rowsum_f16f16f32(d, p_f16[mma_kv]);
     }
 #pragma unroll
@@ -577,12 +729,12 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
       for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 2; ++mma_d) {
         uint32_t v_frag[4];
         ckv_smem.ldmatrix_m8n8x4_trans(ckv_smem_offset_r, v_frag);
-        mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeKV>(
+        mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
             o_frag[mma_d], (uint32_t*)p_f16[mma_kv], v_frag);
         ckv_smem_offset_r = ckv_smem.template advance_offset_by_column<2>(ckv_smem_offset_r, mma_d);
       }
       ckv_smem_offset_r =
-          ckv_smem.template advance_offset_by_row<16, UPCAST_STRIDE_CKV>(ckv_smem_offset_r) -
+          ckv_smem.template advance_offset_by_row<16, UPCAST_STRIDE_V>(ckv_smem_offset_r) -
           NUM_MMA_D_CKV;
     }
   }
@@ -977,6 +1129,16 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       cp_async::wait_group<NUM_STAGES - 1>();
       __syncthreads();
 
+      if constexpr (KTraits::USE_KV_REPACK) {
+        // Dequantize this tile's FP8 KV into the BF16 staging buffers. The
+        // __syncthreads() above guarantees (a) this tile's cp.async data is
+        // visible and (b) every thread finished the previous iteration's PV
+        // reads of the staging buffers, so overwriting them here is safe.
+        repack_fp8_kv_to_bf16<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant.ckv_scale,
+                                       variant.kpe_scale);
+        __syncthreads();
+      }
+
       // compute mla qk
       compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
 
@@ -1007,6 +1169,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       cp_async::wait_group<NUM_STAGES - 1>();
       __syncthreads();
 
+      if constexpr (KTraits::USE_KV_REPACK) {
+        // See the masked loop above for the barrier reasoning.
+        repack_fp8_kv_to_bf16<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant.ckv_scale,
+                                       variant.kpe_scale);
+        __syncthreads();
+      }
+
       // compute mla qk
       compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
 
@@ -1029,6 +1198,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     // last tiles
 #pragma unroll
     for (; kv_tile_idx >= 0; --kv_tile_idx) {
+      if constexpr (KTraits::USE_KV_REPACK) {
+        // Unlike the pipelined loops above, this loop has no inter-iteration
+        // barrier: wait until every thread finished the previous iteration's
+        // PV reads of the staging buffers before overwriting them.
+        __syncthreads();
+        repack_fp8_kv_to_bf16<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant.ckv_scale,
+                                       variant.kpe_scale);
+        __syncthreads();
+      }
       // compute mla qk
       compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
 
@@ -1069,27 +1247,36 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       o_stride_h, num_heads, params.return_lse_base_on_e);
 }
 
-#define DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, ...) \
-  if (smem_limit_per_sm >= 221696) {                                                    \
-    constexpr uint32_t NUM_STAGES = 2;                                                  \
-    constexpr uint32_t CTA_TILE_KV = 64;                                                \
-    constexpr bool QK_SHARD = true;                                                     \
-    __VA_ARGS__;                                                                        \
-  } else if (smem_limit_per_sm >= 147968) {                                             \
-    constexpr uint32_t NUM_STAGES = 2;                                                  \
-    constexpr uint32_t CTA_TILE_KV = 32;                                                \
-    constexpr bool QK_SHARD = true;                                                     \
-    __VA_ARGS__;                                                                        \
-  } else if (smem_limit_per_sm >= 92672) {                                              \
-    constexpr uint32_t NUM_STAGES = 1;                                                  \
-    constexpr uint32_t CTA_TILE_KV = 16;                                                \
-    constexpr bool QK_SHARD = false;                                                    \
-    __VA_ARGS__;                                                                        \
-  } else {                                                                              \
-    std::ostringstream err;                                                             \
-    err << "Unsupported shared memory size: " << smem_limit_per_sm;                     \
-    FLASHINFER_ERROR(err.str());                                                        \
-    return cudaErrorNotSupported;                                                       \
+// Tier thresholds are the exact sizeof(SharedStorage) for HEAD_DIM_CKV=512,
+// HEAD_DIM_KPE=64. The FP8 KV path halves the raw KV buffers but adds the BF16
+// dequant staging buffers, so it needs *more* smem than the 16-bit path; the
+// lowest tier (16-bit: 92672B) would need 102912B with FP8, which exceeds the
+// 100KB smem of SM86/SM89, hence FP8 is rejected there.
+#define DISPATCH_SMEM_CONFIG(smem_limit_per_sm, kv_is_fp8, NUM_STAGES, CTA_TILE_KV, QK_SHARD, \
+                             ...)                                                             \
+  if (smem_limit_per_sm >= ((kv_is_fp8) ? 229888 : 221696)) {                                 \
+    constexpr uint32_t NUM_STAGES = 2;                                                        \
+    constexpr uint32_t CTA_TILE_KV = 64;                                                      \
+    constexpr bool QK_SHARD = true;                                                           \
+    __VA_ARGS__;                                                                              \
+  } else if (smem_limit_per_sm >= ((kv_is_fp8) ? 152064 : 147968)) {                          \
+    constexpr uint32_t NUM_STAGES = 2;                                                        \
+    constexpr uint32_t CTA_TILE_KV = 32;                                                      \
+    constexpr bool QK_SHARD = true;                                                           \
+    __VA_ARGS__;                                                                              \
+  } else if (!(kv_is_fp8) && smem_limit_per_sm >= 92672) {                                    \
+    constexpr uint32_t NUM_STAGES = 1;                                                        \
+    constexpr uint32_t CTA_TILE_KV = 16;                                                      \
+    constexpr bool QK_SHARD = false;                                                          \
+    __VA_ARGS__;                                                                              \
+  } else {                                                                                    \
+    std::ostringstream err;                                                                   \
+    err << "Unsupported shared memory size: " << smem_limit_per_sm                            \
+        << (kv_is_fp8 ? " (FP8 KV cache for MLA requires at least 152064 bytes of shared "    \
+                        "memory per SM, i.e. SM80 or SM90+)"                                  \
+                      : "");                                                                  \
+    FLASHINFER_ERROR(err.str());                                                              \
+    return cudaErrorNotSupported;                                                             \
   }
 
 template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
@@ -1113,7 +1300,8 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
   cudaGetDevice(&device);
   cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
 
-  DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, {
+  constexpr bool KV_IS_FP8 = std::is_same_v<DTypeKV, __nv_fp8_e4m3>;
+  DISPATCH_SMEM_CONFIG(smem_limit_per_sm, KV_IS_FP8, NUM_STAGES, CTA_TILE_KV, QK_SHARD, {
     using KTraits = KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
                                  /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
     size_t smem_size = sizeof(typename KTraits::SharedStorage);
