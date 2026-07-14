@@ -86,6 +86,39 @@ def _bench_one(batch_size, seq_len, num_heads, page_size, kv_dtype, backend):
     return ms, io
 
 
+def fixed_budget_throughput(backend="fa2", page_size=64):
+    """Fixed-HBM-budget throughput: BF16 at batch B vs FP8 at batch 2B (equal KV
+    footprint). If MLA decode were memory-capacity-bound with spare compute, FP8
+    would ~double throughput. Since SM80 MLA decode is compute-bound, throughput
+    (requests-steps / s) is expected to stay ~flat (~0.86x), not 2x."""
+    print("\n=== fixed HBM budget: BF16 batch B vs FP8 batch 2B (equal KV bytes) ===")
+    header = (
+        f"{'heads':>5} {'seq_len':>7} {'B(bf16)':>8} {'2B(fp8)':>8} | "
+        f"{'bf16 ms':>8} {'fp8 ms':>8} | "
+        f"{'bf16 kreq/s':>11} {'fp8 kreq/s':>11} {'thrpt x':>8}"
+    )
+    print(header)
+    print("-" * len(header))
+    for num_heads in [16, 128]:
+        for seq_len in [16384, 65536]:
+            for batch_b in [8, 16]:
+                ms_bf16, _ = _bench_one(
+                    batch_b, seq_len, num_heads, page_size, torch.bfloat16, backend
+                )
+                ms_fp8, _ = _bench_one(
+                    2 * batch_b, seq_len, num_heads, page_size,
+                    torch.float8_e4m3fn, backend,
+                )
+                # throughput = requests advanced one decode step per second
+                tp_bf16 = batch_b / (ms_bf16 * 1e-3) / 1e3
+                tp_fp8 = (2 * batch_b) / (ms_fp8 * 1e-3) / 1e3
+                print(
+                    f"{num_heads:>5} {seq_len:>7} {batch_b:>8} {2 * batch_b:>8} | "
+                    f"{ms_bf16:>8.4f} {ms_fp8:>8.4f} | "
+                    f"{tp_bf16:>11.2f} {tp_fp8:>11.2f} {tp_fp8 / tp_bf16:>7.2f}x"
+                )
+
+
 def main():
     backend = "fa2"
     page_size = 64
@@ -98,7 +131,7 @@ def main():
     print(header)
     print("-" * len(header))
     for num_heads in [16, 128]:
-        for seq_len in [1024, 4096, 16384]:
+        for seq_len in [1024, 4096, 16384, 32768, 65536]:
             for batch_size in [16, 64]:
                 ms_bf16, io_bf16 = _bench_one(
                     batch_size, seq_len, num_heads, page_size, torch.bfloat16, backend
@@ -122,3 +155,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    fixed_budget_throughput()
