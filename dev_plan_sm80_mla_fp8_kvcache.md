@@ -27,6 +27,10 @@
   **~0.85x（0.68–1.09x）**，因为 MLA decode 是 compute-bound——算力早已打满、没有空闲让多出的
   batch 去填，加 batch 只是线性堆延迟。"容量翻倍→吞吐翻倍"只在 memory-capacity-bound 且算力
   有空闲时成立（GQA），MLA 两个前提都不满足（见 §0.6.6）。
+- **但有一个真实工况 FP8 能兑现吞吐**：**内存受压、BF16 KV 持续 retract（抢占后重算）** 时
+  （如输入 1k/输出 32k、大 batch），FP8 减半 KV → 越过显存悬崖 → 避免重算浪费 → 有效吞吐上升；
+  且**原生 fp8-kv 比"手动 python dequant 成 bf16 再喂 flashinfer"少一整趟 HBM 往返 + 临时显存**，
+  收益更满（sglang 实测手动方案 +~5%，原生应 ≥ 之；见 §0.6.7）。
 - **对照实证**：同机同法测 GQA decode，FP8 **加速 1.2–1.6x**（因为 GQA memory-bound）——
   正好反衬出 MLA 的 compute-bound 特性（§0.6）。
 
@@ -247,6 +251,48 @@ batch 16→64（4x）时吞吐代理 `batch/latency` 不升反降（5.28→4.34 
 算力就已饱和。compute-bound 下延迟 ≈ k×(batch×seq×heads)，FP8 塞 2x batch → FLOP 翻倍 →
 延迟翻倍 → 吞吐不变，再叠加 repack ~16% 开销故略亏。**因此"省显存"是可行性/容量收益（能跑、
 能装更长、省卡），而非吞吐加速——后者在 SM80 MLA 上不成立。**
+
+> 📌 **适用范围**：本节测的是"显存不吃紧的稳态"（BF16 也塞得下 batch）。当系统**内存受压、
+> 会 retract/抢占**时,结论不同——见 §0.6.7,那里省显存能通过"避免重算浪费"兑现成真实吞吐。
+
+#### 0.6.7 原生 fp8-kv vs 手动 python dequant：省一趟 HBM 往返 + retract 区才是兑现吞吐的场景
+
+§0.6.6 的"无收益"是**显存充裕稳态**下的结论。真实 serving 常见的另一种工况——**大 batch + 长输出
+（如输入 1k / 输出 32k）导致显存吃紧、BF16 KV 不断 retract（抢占后重算）**——FP8 反而有实打实的
+吞吐收益。这里区分两条对比线：
+
+**（1）为什么原生 fp8-kv 比"手动 python dequant"更快。**
+老 flashinfer 的 MLA（SM80）只支持 qkv 全 bf16，用户若想省显存只能：把 KV 以 FP8 存 HBM →
+计算前用 PyTorch **手动反量化成 BF16 写回 HBM** → 再喂给 flashinfer。每个 decode step 对被
+attend 的 KV，其 HBM 流量为：
+
+| 路径 | KV 的 HBM 流量 | 额外开销 |
+|--|--|--|
+| 手动 dequant（老） | ①读FP8 0.5x + ②写BF16 1.0x + ③读BF16 1.0x = **2.5x** | 独立 dequant kernel 启动 + 临时 BF16 buffer |
+| **本分支原生**（bf16-q/fp8-kv） | 直接读 FP8 **0.5x**，在 smem 内 dequant → MMA | **无**写回、无重读、无临时 buffer、无额外 kernel |
+
+原生路径省掉的正是 ②③ 那 **2.0x 的 KV HBM 流量 + 一次 kernel 启动 + 那块临时 BF16 显存**。
+
+⚠️ **收益归因要准**：提升**不是** attention 计算变快了——原生 FP8 kernel 因 smem repack 反而比
+纯 bf16 kernel 慢 ~16%（§0.6.3 的 0.86x）。收益全来自：**(a)** 消掉独立 dequant pass（它自身
+读 0.5x + 写 1.0x = 1.5x KV 流量的 memory-bound 扫描）；**(b)** 消掉临时 BF16 buffer → 峰值显存
+更低 → retract 区里再少几次抢占；**(c)** attention 内 KV 读取 1.0x→0.5x。粗算：老方案 ≈
+`dequant_pass + bf16_attn`，原生 ≈ `1.16 × bf16_attn`；只要 `dequant_pass` 耗时 > 16% 的
+`bf16_attn`（长序列下通常成立，因 dequant 是对全部历史 KV 的一趟扫描），原生即更快。
+
+**（2）为什么这个场景 FP8 能兑现吞吐（而 §0.6.6 不能）。**
+retract = 显存装不下 → 驱逐请求、之后**重算**，浪费的是算力。FP8 把 KV 减半 → 越过显存悬崖 →
+**避免重算浪费** → 有效吞吐上去。这正是"可行性/容量收益"在**内存受压工况**下兑现成吞吐的形态：
+**收益 = 帮你避开 retract 悬崖那一下**；悬崖以下（显存够）没用（§0.6.6），卡在悬崖上（此场景）
+就是实打实的收益。原生实现峰值显存更低、又省 dequant 开销，能把这个收益吃得更满。
+
+**实证参考**：用户在 sglang 上以"FP8 存储 + 手动 dequant"替换 BF16 存储（输入 1k/输出 32k、大
+batch、原 BF16 持续 retract），**端到端吞吐 +~5%**。本分支的原生 fp8-kv 理论上应**≥ 该数值**
+（多省一趟 HBM 往返 + 临时显存）。
+
+⚠️ **边界**：幅度有界、依赖 workload 与 dequant 具体实现（整 cache / 分页 / 是否已融合）。坐实
+数字需在 sglang 用本分支原生 fp8 MLA 对比手动方案、端到端跑 retract 区；单 kernel 微基准
+（§0.6.3/0.6.6）复现不了 retract 动态。
 
 ---
 
