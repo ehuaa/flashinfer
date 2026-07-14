@@ -8,6 +8,25 @@
 
 ---
 
+## 实施状态与核心结论（已完成，回填实测）
+
+> 本文档最初是开发前的规划，下面这段是**开发完成后**根据实际实现与 A100 实测回填的结论摘要；
+> 后续各阶段（Week 3/4）也已按实际发生的情况更新。
+
+- **功能已实现并验证**：`mla.cuh` FA2 路径支持 FP8(e4m3) KV cache，A100(SM80) 上
+  **155 个 FP8 精度用例全过、1350 个 BF16 回归用例零回归**。csrc/绑定层零改动（复用 PR #3694
+  已铺好的 `ckv_scale`/`kpe_scale` 管道），实质改动集中在 `mla.cuh` + `_core.py` guard + 测试参数化。
+- **一个与最初预期相反的关键发现**：**MLA decode 是 compute-bound，不是 memory-bound**，
+  所以 FP8 KV **在 A100 上不会带来 decode 加速**（实测 0.86–0.96x，即回退 4–14%），
+  即便做了"prefetch 与 QK/PV 重叠"的流水优化也只从 0.83–0.94x 抬到 0.86–0.96x。
+  这**推翻了最初计划里"长序列 FP8 有正吞吐收益"的假设**（见 §0.6 的 roofline 分析与实测）。
+- **FP8 对 MLA 的真实价值是"KV cache 显存精确减半"**（容量翻倍 → 更大 batch / 更长 context），
+  这是"系统级用显存换吞吐"的收益，不是单 kernel 加速。这与"给 A100 省显存"的原始诉求吻合。
+- **对照实证**：同机同法测 GQA decode，FP8 **加速 1.2–1.6x**（因为 GQA memory-bound）——
+  正好反衬出 MLA 的 compute-bound 特性（§0.6）。
+
+---
+
 ## 0. 背景与现状分析
 
 ### 0.1 GQA / MHA 在 SM80 上已经支持 FP8 KV cache
@@ -101,6 +120,96 @@ SM80 也必须走这条路。
 即：**FP8 MLA 的 FA2 路径支持 A100（SM80）和 Hopper，sm86/sm89 因 smem 不足不支持**，
 Python 与 C++ 两层都要给出明确报错，不能静默算错。
 
+### 0.6 FP8 KV 的性能特征：为什么 MLA 上 FP8 不加速（roofline 分析 + 实测）
+
+这是本项目**最重要、也最反直觉的结论**，务必在动手前就理解清楚，否则会像最初计划那样错误地
+预期"长序列 FP8 提速"。
+
+#### 0.6.1 核心：GQA 是 memory-bound，MLA 是 compute-bound
+
+FP8 KV 的加速逻辑只有一条：**当 kernel 卡在读 KV 的带宽上时**，把 KV 减半才能换来时间。
+是否卡在带宽上，由 **算术强度（arithmetic intensity, AI = FLOP / 读取字节）** 相对 GPU 的
+**ridge point** 决定：
+
+- A100(SXM) ridge point ≈ FP16 tensor core 峰值 312 TFLOPS ÷ HBM 峰值 ~2.0 TB/s ≈ **156 FLOP/byte**；
+- AI ≪ 156 → **memory-bound** → FP8 有效；AI ≫ 156 → **compute-bound** → FP8 无益。
+
+decode 场景对每个 KV token 的 AI：
+
+| 场景 | 每个 KV token 服务几个 query head | AI(BF16) | 相对 156 | 瓶颈 |
+|---|---|---|---|---|
+| **GQA/MHA decode** | 只 `group` 个（典型 4–8） | `group×2/2` ≈ **8** | ≪ 156 | **memory-bound** |
+| **MLA decode（absorbed）** | **全部 128 个 head 共享一份 ckv latent** | ≈ **242** | ≫ 156 | **compute-bound** |
+
+MLA 用 `≈ h × (576+512) × 2 / (576 × 2) ≈ h × 1.9`（`h` = head 数）估 AI。关键在于
+**MLA 的 ckv(512)+kpe(64) 被所有 `h` 个 head 共享**——这是 MLA 的核心设计（MQA-like 存储、
+MHA-like 表达力），它在**算法层面**就把 KV 带宽压力消掉了，代价是把 decode 变成了一个
+高算术强度的 128-head GEMM。所以到 MLA 这里，FP8 已经**没有多余的带宽红利可吃**。
+
+#### 0.6.2 各主流 MLA 模型的 head 数（决定 AI）
+
+`h` 由模型决定，直接决定 FP8 是否可能有速度收益：
+
+| 模型 | 注意力 | `num_attention_heads` | BF16 AI ≈ h×1.9 | vs 156 |
+|---|---|---:|---:|---|
+| DeepSeek-V2 / V3 / R1 | MLA | **128** | ~242 | compute-bound |
+| GLM-5 / 5.1（`Glm5MoeDsa`） | MLA + DSA | ~64 | ~121 | 临界 |
+| DeepSeek-V2-Lite | MLA | **16** | ~30 | 偏 memory-bound |
+| GLM-4.5 / 4.6 | **GQA（非 MLA）** | 96q / 8kv | ~8 | memory-bound |
+
+注意：**GLM-4.5/4.6 用的是 GQA 不是 MLA**，到 GLM-5 才用 MLA。主流 MLA 旗舰（V2/V3=128、
+GLM-5.1≈64）的 head 数都足够高，落在 compute-bound 或临界区。本项目 benchmark 用的
+`num_heads=128`/`16` 正是对应 V2/V3 满配与 V2-Lite。
+
+#### 0.6.3 A100 实测（同机同法，`benchmarks/bench_deepseek_mla_fp8_kv.py`）
+
+**MLA decode（fa2, page_size=64, ckv=512+kpe=64, q=bf16）**——优化后：
+
+| batch | seq_len | heads | bf16 ms | fp8 ms | 加速比 | bf16 GB/s |
+|--:|--:|--:|--:|--:|--:|--:|
+| 64 | 4096 | 128 | 0.949 | 1.099 | **0.86x** | 337 |
+| 64 | 16384 | 128 | 3.714 | 4.321 | **0.86x** | 330 |
+| 16 | 1024 | 16 | 0.047 | 0.049 | **0.96x** | 412 |
+| 64 | 16384 | 16 | 1.872 | 2.176 | **0.86x** | 646 |
+
+**GQA decode 对照（group=8, head_dim=128, tensor-core decode）**：
+
+| batch | seq_len | bf16 ms | fp8 ms | 加速比 | bf16 GB/s |
+|--:|--:|--:|--:|--:|--:|
+| 64 | 4096 | 0.621 | 0.400 | **1.55x** | 1728 |
+| 64 | 16384 | 2.371 | 1.500 | **1.58x** | 1811 |
+
+**铁证**：GQA BF16 带宽 ~1800 GB/s ≈ **89% HBM 峰值**（memory-bound）→ FP8 加速 1.5x；
+MLA BF16 带宽只 ~340 GB/s ≈ **17% HBM 峰值**（compute-bound，SM 忙于算 GEMM）→ FP8 无益。
+且 MLA 中 `num_heads` 越大带宽越低（128→330 vs 16→646），越 compute-bound、FP8 越吃亏，
+完全符合 AI 随 head 数上升的分析。
+
+> ⚠️ 一个易踩的坑：GQA FP8 若用**默认非 tensor-core decode**（`use_tensor_cores=False`）会走
+> 标量 dequant 慢路径（实测 0.06x）。文章/上表的加速来自 `use_tensor_cores=True` + `k/v_scale`
+> 的 tensor-core decode 路径。
+
+#### 0.6.4 与 SM90（PR #3694）的关系澄清
+
+- **SM90 的 MLA FP8 也不用 FP8 tensor core**：`mla_hopper.cuh` 注释明确写
+  "WGMMA itself stays BF16xBF16 because Hopper does not have a mixed BF16xFP8 wgmma instruction"。
+  因为是 bf16-Q × fp8-KV 的混合精度，硬件层面走不了 fp8 wgmma，只能反量化回 bf16——**和 SM80 做法本质相同**。
+- 所以 **SM90 上 MLA FP8 decode 大概率也不加速**（同样 compute-bound）；PR #3694 本身只有
+  正确性测试、无 benchmark，从未声称提速。SM90 相对 SM80 的唯一优势是 **warp specialization + TMA**
+  让 repack 能和 WGMMA 真正流水重叠，因此**回退更小**，而非"因为有 fp8 tensor core 所以更快"。
+
+#### 0.6.5 FP8 对 MLA 唯一能提速的窄窗口
+
+FP8 只有在 **memory-bound 的 MLA 计算**里才提速，条件是 **un-absorbed（每 head 独立 K/V）
++ 短 q（低 AI）** 同时成立，例如：
+- chunked prefill 的**小 chunk + 长 prefix**（读大量历史 latent、q chunk 短）；
+- MTP / speculative decode 的 **verify**（q 是几个 draft token）。
+
+sglang 的 `forward_mha.py`（un-absorbed，把 latent 解压成 per-head K/V 走标准 flash-attn）满足
+"每 head 独立 KV"，但它用于 **prefill、q 通常很长**，默认仍是 compute-bound；只有落到上述短-q
+子场景才 memory-bound、FP8 才有速度价值。而标准 decode 用 absorbed（compute-bound），
+标准 prefill q 长（compute-bound），两头都不满足——所以这个窗口很窄，**FP8 对 MLA 的稳定价值
+始终是省显存**。
+
 ---
 
 ## 1. Week 1 — C++ / CUDA 基础（学习周 1）
@@ -157,7 +266,13 @@ Python 与 C++ 两层都要给出明确报错，不能静默算错。
   来避免 bank conflict；
 - FP8 格式：e4m3 / e5m2 的数值范围，per-tensor 对称量化（`scale = amax / 448`），
   `__nv_fp8_e4m3`、`vec_cast` 批量类型转换；
-- 关键认知：**SM80 无 FP8 MMA，FP8 KV 的收益 = 显存减半 + gmem 带宽减半，代价 = 计算前反量化**。
+- **roofline / 算术强度（arithmetic intensity）模型**：memory-bound vs compute-bound、
+  ridge point 的概念——这是判断"FP8 减半 KV 带宽到底有没有速度收益"的唯一正确工具，
+  务必配合 §0.6 一起理解；
+- 关键认知（**已按实测更正**）：**SM80 无 FP8 MMA，FP8 KV 必须计算前反量化成 BF16**。
+  FP8 省显存是**无条件**的（KV 存储精确减半）；但 FP8 是否**提速**取决于 kernel 是不是
+  memory-bound——GQA/MHA decode 是（FP8 加速），**MLA decode 不是**（compute-bound，
+  FP8 反而因多出 dequant 而小幅回退，见 §0.6）。**不要想当然地认为"带宽减半 = 加速"。**
 
 参考资料：
 - [PTX ISA 文档](https://docs.nvidia.com/cuda/parallel-thread-execution/) "Warp Level Matrix
@@ -175,7 +290,10 @@ Python 与 C++ 两层都要给出明确报错，不能静默算错。
   （e4m3/e5m2 的定义与动机）；
 - [CUDA Math API 文档](https://docs.nvidia.com/cuda/cuda-math-api/) 的 FP8 部分
   （`cuda_fp8.h`：`__nv_fp8_e4m3` 类型与转换 intrinsics）；
-- 本仓库 FP8 转换实现：`include/flashinfer/vec_dtypes.cuh` 的 `vec_cast<bf16, fp8_e4m3>`。
+- 本仓库 FP8 转换实现：`include/flashinfer/vec_dtypes.cuh` 的 `vec_cast<bf16, fp8_e4m3>`；
+- **roofline 模型**：[Roofline: An Insightful Visual Performance Model (Williams et al., CACM 2009)](https://dl.acm.org/doi/10.1145/1498765.1498785)
+  或任意"roofline / arithmetic intensity"入门；配合本文档 §0.6 把 GQA/MLA 各自的 AI 算一遍，
+  理解"为什么同样是 FP8 KV，GQA decode 加速而 MLA decode 不加速"。
 
 ### Day 7：FlashAttention 算法
 
@@ -236,22 +354,36 @@ pytest tests/attention/test_deepseek_mla.py -k "not fp8" -x -q
 - 对照代码：`flashinfer/mla/_core.py`、`csrc/batch_mla_run.cu`、`csrc/batch_mla_binding.cu`、
   `flashinfer/jit/attention/modules.py::gen_batch_mla_module`。
 
-### Day 3：MLA 算法与 paged KV cache
+### Day 3：MLA 算法（含两种计算方式）与 paged KV cache
 
 学习内容：
 - MLA（Multi-head Latent Attention）：ckv（512 维 compressed KV）+ kpe（64 维 rope K）、
   q_nope / q_pe 的双段 QK、为什么 ckv 既是 K 又是 V；
+- **MLA 的两种数学等价、性能特征却相反的计算方式**（理解 §0.6 的前提，务必搞懂）：
+  - **absorbed（矩阵吸收 / MQA-like）**：把 `W_uk` 吸收进 `W_q`、`W_uv` 吸收进 `W_o`，
+    attention 直接在压缩的 ckv latent 上算，**128 个 head 共享一份 ckv**。用于 **decode**
+    （q=1，省显存省带宽），**算术强度高 → compute-bound**。这就是 `mla.cuh` 这个 kernel 走的路径；
+  - **un-absorbed（MHA 方式）**：用 `kv_b_proj` 把 latent 解压回每个 head 的完整 K/V
+    （head_dim 192/128），走标准 flash-attention。用于 **prefill/extend**（q 长，计算量比
+    absorbed 小），**长 q 时 compute-bound；短 q 时才 memory-bound**（见 §0.6.5）。
+    sglang `forward_mha.py` 就是这条路径；
 - paged KV cache：page_table / kv_indices / kv_indptr 的寻址方式；
 - 对照 `load_kv()` 里 `block_size.divmod(packed_block_iter, q, r)` 理解 page 寻址。
 
 参考资料：
 - [DeepSeek-V2 论文 (arXiv:2405.04434)](https://arxiv.org/abs/2405.04434) 第 2.1 节
   （MLA 定义，重点看矩阵吸收后 attention 只作用于 c^KV 和 k^R 的形式——这正是
-  kernel 里 ckv/kpe 两个 cache 的来源）；
+  kernel 里 ckv/kpe 两个 cache 的来源、以及 absorbed 方式的数学基础）；
+- absorbed vs un-absorbed 的工程解释：sglang / vLLM 的 MLA 实现博客与源码
+  （sglang `python/sglang/srt/models/deepseek_common/attention_forward_methods/` 目录下
+  `forward_mha.py`(un-absorbed prefill) 与 absorbed decode 路径对照）；
 - [vLLM / PagedAttention 论文 (arXiv:2309.06180)](https://arxiv.org/abs/2309.06180)
   （paged KV cache 的动机与结构）；
 - [FlashInfer 官方文档](https://docs.flashinfer.ai/) 的 MLA API 页
   （`BatchMLAPagedAttentionWrapper` 的参数语义：qo_indptr / kv_indptr / kv_indices / kv_len_arr）；
+- 各模型 head 数（决定算术强度）：DeepSeek-V2/V3 config（128 heads）、
+  [DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite)（16 heads）、
+  GLM-5/5.1 `Glm5MoeDsa` config（~64，MLA）、GLM-4.5/4.6（96q/8kv，**GQA 非 MLA**）；
 - 对照代码：`tests/attention/test_deepseek_mla.py` 中任一 BF16 测试的数据构造部分
   （最直观的"MLA 输入长什么样"）。
 
@@ -328,6 +460,14 @@ pytest tests/attention/test_deepseek_mla.py -k "not fp8" -x -q
 QK/PV MMA 照常走 BF16**。SM80 没有 producer/consumer warpgroup 分工，256 线程全员参与
 repack，比 Hopper 版简单。
 
+> **实际实现对照**：Day 1–5 的 kernel 改造与计划基本一致，均已落地并通过编译/正确性验证。
+> 几处值得记录的实际细节：
+> - **A100 实测走 tier2**（`NUM_STAGES=2, CTA_TILE_KV=32, QK_SHARD=true`）——不是 tier1(CTA_TILE_KV=64)，
+>   因为 A100 的 164KB smem 装不下 tier1；
+> - **smem 精确尺寸已用 nvcc `static_assert` 核验**：FP8 `sizeof(SharedStorage)` 恰为
+>   tier2=152064B、tier1=229888B，与 `DISPATCH_SMEM_CONFIG` 阈值精确吻合（不是估算）；
+> - 提交历史见分支 `dev-plan-sm80-mla-fp8` 的 commit `feat: FP8 KV cache support for SM80 (A100) FA2 MLA`。
+
 ### Day 1：KernelTraits + SharedStorage（改 `mla.cuh`）
 
 - `KernelTraits` 新增：
@@ -403,20 +543,42 @@ repack，比 Hopper 版简单。
 - 保留 q 必须 bf16、head_dim 必须 512/64 的限制（与 SM90 一致）；`run()` 无需改动；
 - 在 A100 上手跑一个最小 case（batch=1, page_size=1, 短 kv），与 BF16 reference 对比。
 
+### Day 8（延伸，实际追加）：prefetch 与 QK/PV 重叠的流水优化
+
+> 这一步不在最初计划里，是 benchmark 发现 FP8 回退后尝试的性能优化，作为**真实开发经历**记录。
+
+- **动机**：初版把 repack 做成独立 pass（`wait → __sync → repack → __sync → compute`），
+  repack 是纯额外开销。观察到 **BF16 staging 让 compute 与原始 FP8 buffer 解耦**——repack 一完成，
+  FP8 stage buffer 就可复用——于是把下一 tile 的 `cp.async` 预取**从 compute 尾部提前到 repack 之后**，
+  让 DMA 覆盖整个 QK/PV 段，并省掉一个 `__syncthreads`（BF16 路径经 `if constexpr` 保持原样）。
+- **踩坑（竞态）**：`kpe_p_smem` 是 `union{ kpe; p }`，QK_SHARD 下 `compute_mla_pv` 用 `.p` 做 P 的
+  all-gather 中转。提前 prefetch 后，`load_kv` 的异步 cp.async 写 `.kpe` 与同轮 `compute_mla_pv`
+  写 `.p`（union 同址）**数据竞争**，冲坏下一 tile 的 KPE → 下轮 repack 读到垃圾（输出 `1e32`）。
+  `num_heads=16` 因 timing 没触发、`num_heads=128` 稳定复现——典型的竞态特征。
+- **修复（零额外 smem）**：把 FP8 路径的 P all-gather 中转从 `.p` 改用 `kpe_bf16_smem`
+  （QK 阶段已消费完、PV 阶段空闲，且大小正好 `HEAD_DIM_KPE == CTA_TILE_Q == 64` 相等），
+  与 prefetch 写的 `.kpe` 彻底解耦。
+- **结果**：加速比从 0.83–0.94x 抬到 **0.86–0.96x**（延迟降 ~3–4%），但**仍 < 1.0x**——
+  因为 MLA compute-bound，能重叠的只是 DMA 延迟，repack 的 ALU/smem 指令本身是硬开销，
+  无法像 SM90(warp specialization) 那样和 WGMMA 真正并行掩盖（见 §0.6）。
+- 对应 commit：`perf: overlap FP8 KV prefetch with QK/PV on SM80 MLA`。
+
 ---
 
 ## 4. Week 4 — 测试、调试、性能与提交
 
-### Day 1–2：正确性测试
+### Day 1–2：正确性测试（**实际已完成，全过**）
 
 - `tests/attention/test_deepseek_mla.py`：把 PR #3694 加的
   `test_batch_mla_fp8_kv_matches_bf16_reference` 等 FP8 测试**参数化 backend（fa2/fa3）**，
-  SM80 设备上跑 fa2 分支，误差阈值对齐 SM90 标准；
+  SM80 设备上跑 fa2 分支，误差阈值对齐 SM90 标准；新增 `_skip_if_fp8_mla_unsupported()`
+  按 (backend, device) 跳过；
 - 覆盖维度：batch size、kv_len（跨 mask/no-mask/last-tiles 三个循环段的长短组合）、
-  page_size（1 / 64）、causal 开关、num_heads（16/64/128，触发不同 split 调度）；
-- **BF16 回归**：跑全量既有 MLA 测试，确认 P→DTypeQ 等改动对 BF16 路径零影响。
+  page_size（16 / 64）、causal 开关、num_heads（16 / 128）；
+- **实测结果**：A100 上 **155 个 FP8 精度用例全过**；**BF16 回归 1350 用例零回归**
+  （证实 P→DTypeQ、staging 改动对 BF16 路径逐 bit 无影响）。
 
-### Day 3–4：调试与排错（预留缓冲）
+### Day 3–4：调试与排错（预留缓冲，**实际用于定位流水优化的竞态**）
 
 常用手段：
 - [`compute-sanitizer`](https://docs.nvidia.com/compute-sanitizer/) 的
@@ -425,45 +587,58 @@ repack，比 Hopper 版简单。
 - `FLASHINFER_JIT_DEBUG=1`（-O0 + 调试符号）+ `FLASHINFER_JIT_VERBOSE=1`
   （用法见 `CLAUDE.md` 与 `.claude/skills/debug-cuda-crash/skill.md`）；
 - 分段验证法：先把 scale 固定为 1.0、KV 数值构造成 fp8 可精确表示的值（如小整数），
-  此时 FP8 路径应与 BF16 路径**逐 bit 一致**，二分定位是 QK 段还是 PV 段出错。
+  此时 FP8 路径应与 BF16 路径**逐 bit 一致**，二分定位是 QK 段还是 PV 段出错；
+- **实际经历**：流水优化引入的 union 竞态就是靠"`num_heads=128` 稳定复现 + `1e32` 垃圾值 +
+  推断 `kpe_p_smem` union 同址"定位的（详见 Week 3 Day 8），也可用 racecheck 直接抓。
 
-### Day 5：性能验证
+### Day 5：性能验证（**实际结论与最初假设相反**）
 
-- `benchmarks/flashinfer_benchmark.py` 对比 FP8 vs BF16 KV 的 decode 吞吐
-  （用法见 `.claude/skills/benchmark-kernel/skill.md`；关注长 kv_len：FP8 的收益是
-  KV 显存减半 + gmem 带宽减半，A100 上 repack 吃一点 SM 算力，预期长序列下净收益为正）；
-- 若 repack 成为瓶颈，可尝试的优化（记录数据后再决定）：repack 与 cp.async 重叠、
-  只对 ckv 做 staging 而 kpe 走寄存器 dequant。
+- benchmark 脚本：`benchmarks/bench_deepseek_mla_fp8_kv.py`（FP8 vs BF16 KV 的 MLA decode），
+  对照脚本另测 GQA decode；用官方 `bench_gpu_time`；
+- **最初假设（已证伪）**：以为"长 kv_len 下 FP8 省带宽 → 净收益为正"。**实测 FP8 反而回退 4–14%**
+  （0.86–0.96x），因为 **MLA decode 是 compute-bound**（BF16 带宽只 ~340 GB/s，占 A100 HBM 峰值 ~17%），
+  FP8 省的带宽兑不了现，多出的 dequant 是硬开销——**完整分析与数据见 §0.6**；
+- **对照实验**（关键佐证）：同机测 GQA decode（memory-bound），FP8 **加速 1.2–1.6x**、
+  BF16 带宽逼近 HBM 峰值 89%，反证 MLA 的 compute-bound 特性；
+- **结论**：FP8 对 MLA 的价值是**显存减半**而非提速。真正该量化的是"固定显存预算下 FP8 让
+  并发 batch 翻倍 → 系统级吞吐提升"（可作后续实验）。
 
 ### Day 6–7：收尾与提交
 
 - `pre-commit run -a`（格式与 lint）；
 - 整理 PR 描述（对照 PR #3694 的格式）：动机、设计（附 smem 预算表）、支持范围
-  （SM80 ✅ / sm86,89 ❌ 及原因）、精度与性能数据；
+  （SM80 ✅ / sm86,89 ❌ 及原因）、**精度数据 + 诚实的性能特征说明（compute-bound、FP8 主打省显存，
+  附 §0.6 的 roofline 分析与 GQA 对照）**；
 - 提交 PR 到 `flashinfer-ai/flashinfer`，根据 review 意见迭代。
 
 ---
 
 ## 5. 风险与应对
 
-| 风险 | 影响 | 应对 |
-|---|---|---|
-| KPE FP8 行宽 64B 触发 k128B swizzle 地址冲突 | 数据损坏、结果错误 | 照搬 Hopper PR 的 `SWIZZLE_MODE_KPE_RAW = k64B` 方案 |
-| last-tiles 循环缺 barrier，staging 被提前覆盖 | 偶发精度错误（难复现） | Week 3 Day 5 显式补 `__syncthreads()`；racecheck 验证 |
-| P 复用 `kpe_p_smem` 时 FP8 下空间不足 | 越界写 | union 按 DTypeQ 撑大；0.5 的预算表已含此项 |
-| smem 预算算错导致 launch 失败 | `cudaFuncSetAttribute` 报错 | 以 `sizeof(SharedStorage)` 实测值核对表格；A100 实测 |
-| 学习周进度不及预期 | 挤压开发时间 | Week 1/2 的验收标准严格执行；Week 4 Day 3–4 调试日可作缓冲 |
-| BF16 路径回归 | 存量用户受影响 | P→DTypeQ 等共路改动逐一论证"BF16 下数值不变"，并靠全量回归测试兜底 |
+| 风险 | 影响 | 应对 | 实际结果 |
+|---|---|---|---|
+| KPE FP8 行宽 64B 触发 k128B swizzle 地址冲突 | 数据损坏、结果错误 | 照搬 Hopper PR 的 `SWIZZLE_MODE_KPE_RAW = k64B` 方案 | ✅ 已按方案实现，`test_fp8_kv_kpe_dominant_no_row_aliasing` 覆盖 |
+| last-tiles 循环缺 barrier，staging 被提前覆盖 | 偶发精度错误（难复现） | 显式补 `__syncthreads()`；racecheck 验证 | ✅ 已补 |
+| P 复用 `kpe_p_smem` 时 FP8 下空间不足 | 越界写 | union 按 DTypeQ 撑大 | ✅ union 已按 DTypeQ 撑大 |
+| **（新）流水优化中 prefetch 的 cp.async 与 P all-gather 共用 union 竞态** | 静默错误输出（`1e32`），`num_heads=128` 复现 | P 中转改用空闲的 `kpe_bf16_smem` | ✅ 已修（Week 3 Day 8） |
+| smem 预算算错导致 launch 失败 | `cudaFuncSetAttribute` 报错 | 以 `sizeof(SharedStorage)` 实测值核对表格 | ✅ nvcc static_assert 核验：152064/229888 精确吻合 |
+| **（新）误以为 FP8 会给 MLA decode 提速** | 目标设错、性能承诺落空 | 用 roofline 判据 + 实测校正预期 | ⚠️ 已证伪：MLA compute-bound，FP8 不提速，价值在省显存（§0.6） |
+| BF16 路径回归 | 存量用户受影响 | P→DTypeQ 等共路改动逐一论证"BF16 下数值不变"，全量回归兜底 | ✅ 1350 BF16 用例零回归 |
 
-## 6. 验收标准
+## 6. 验收标准（附实际达成情况）
 
-1. A100（SM80）上 `kv_data_type=torch.float8_e4m3fn` + `backend="fa2"` 的
+1. ✅ A100（SM80）上 `kv_data_type=torch.float8_e4m3fn` + `backend="fa2"` 的
    `BatchMLAPagedAttentionWrapper` 端到端跑通；
-2. FP8 输出 vs BF16 reference 的误差满足与 SM90 相同的阈值；scale=1 + 可精确表示数值时逐 bit 一致；
-3. 全量既有 BF16/FP16 MLA 测试零回归；
-4. sm86/sm89 上给出清晰报错而非静默错误结果；
-5. 长序列 decode 场景 FP8 相对 BF16 有正的吞吐收益（附 benchmark 数据）；
-6. PR 提交至 upstream 并通过 CI。
+2. ✅ FP8 输出 vs BF16 reference 的误差满足与 SM90 相同的阈值（155 用例全过）；
+3. ✅ 全量既有 BF16/FP16 MLA 测试零回归（1350 用例）；
+4. ✅ sm86/sm89 在 Python(`plan()`) 与 C++(`DISPATCH_SMEM_CONFIG`) 两层都给出清晰报错，
+   而非静默错误结果；
+5. ⚠️ **原标准"长序列 decode FP8 有正吞吐收益"已按实测改写**：MLA decode 是 compute-bound，
+   FP8 **无 decode 提速**（0.86–0.96x）。修正后的验收目标是——
+   **(a)** 提供 roofline 分析 + GQA/MLA 对照实测，讲清楚"为什么不加速"（§0.6，已完成）；
+   **(b)** FP8 **KV cache 显存精确减半**已由结构验证（每 token 1152B→576B）；
+   **(c)**（可选，后续）固定显存预算下 FP8 让并发 batch 翻倍的系统级吞吐实验；
+6. ⏳ PR 提交至 upstream 并通过 CI（分支 `dev-plan-sm80-mla-fp8` 已就绪，待提 PR）。
 
 ## 7. 参考资料总表
 
@@ -472,9 +647,18 @@ repack，比 Hopper 版简单。
 - [FlashAttention (arXiv:2205.14135)](https://arxiv.org/abs/2205.14135) /
   [FlashAttention-2 (arXiv:2307.08691)](https://arxiv.org/abs/2307.08691)
 - [FP8 Formats for Deep Learning (arXiv:2209.05433)](https://arxiv.org/abs/2209.05433)
-- [DeepSeek-V2 (arXiv:2405.04434)](https://arxiv.org/abs/2405.04434)
+- [DeepSeek-V2 (arXiv:2405.04434)](https://arxiv.org/abs/2405.04434) /
+  [DeepSeek-V3 (arXiv:2412.19437)](https://arxiv.org/pdf/2412.19437)（MLA、head 数）
 - [vLLM / PagedAttention (arXiv:2309.06180)](https://arxiv.org/abs/2309.06180)
 - [FlashInfer (arXiv:2501.01005)](https://arxiv.org/abs/2501.01005)
+- [Roofline (Williams et al., CACM 2009)](https://dl.acm.org/doi/10.1145/1498765.1498785)
+  （§0.6 判断 FP8 是否加速的模型基础）
+
+模型架构 / MLA 计算方式（§0.6 用）：
+- [DeepSeek-V2-Lite · HF](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite)（16 heads）、
+  GLM-5/5.1 `Glm5MoeDsa`（MLA，~64）、GLM-4.5/4.6 `glm4_moe`（GQA，非 MLA）
+- sglang MLA 实现（absorbed decode vs un-absorbed `forward_mha.py` prefill）：
+  `python/sglang/srt/models/deepseek_common/attention_forward_methods/`
 
 官方文档：
 - [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
@@ -497,3 +681,5 @@ repack，比 Hopper 版简单。
 - `include/flashinfer/attention/prefill.cuh::repack_fp8_tile_to_bf16`（SM80 FP8 idiom）
 - `include/flashinfer/permuted_smem.cuh` / `include/flashinfer/mma.cuh` / `include/flashinfer/vec_dtypes.cuh`
 - 本仓库 `CLAUDE.md` 与 `.claude/skills/`（JIT 开发流程、benchmark、调试教程）
+- **本项目产出**：`benchmarks/bench_deepseek_mla_fp8_kv.py`（FP8/BF16 MLA decode 对比，§0.6 数据来源）；
+  分支 `dev-plan-sm80-mla-fp8` 的 commit 序列（实现 → 测试 → 流水优化）
