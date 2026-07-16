@@ -132,6 +132,13 @@ struct KernelTraits {
   // dims; JIT must not instantiate other sizes.
   static_assert(!USE_KV_REPACK || (HEAD_DIM_CKV_ == 512 && HEAD_DIM_KPE_ == 64),
                 "FP8 KV MLA (fa2) currently only supports HEAD_DIM_CKV=512, HEAD_DIM_KPE=64");
+  // The FP8 kernel's Q-arrival wait (see the cp_async::wait_group after the
+  // prologue loads) counts commit groups assuming at most a 2-stage pipeline.
+  // Note the 1-stage tier is still *instantiated* for FP8 (DISPATCH_SMEM_CONFIG
+  // rejects it at runtime only), so it must stay compilable; the wait logic is
+  // correct (merely conservative) for NUM_STAGES == 1.
+  static_assert(!USE_KV_REPACK || NUM_STAGES_ <= 2,
+                "FP8 KV MLA (fa2) Q-arrival wait assumes at most a 2-stage pipeline");
   // Strides for the DTypeQ-typed BF16 dequant staging buffers.
   static constexpr uint32_t UPCAST_STRIDE_CKV_BF16 = HEAD_DIM_CKV / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_KPE_BF16 = HEAD_DIM_KPE / upcast_size<DTypeQ_>();
@@ -533,18 +540,18 @@ __device__ __forceinline__ void update_mdo_states_(typename KTraits::SharedStora
 }
 
 // FP8 KV path: dequantize one tile of CKV/KPE from the packed FP8 shmem buffers
-// into the BF16 staging buffers, applying the per-tensor scales. The destination
-// uses the same k128B swizzle as the 16-bit KV path, so compute_mla_qk /
-// compute_mla_pv read the staging buffers with the standard 16-bit ldmatrix
-// logic. Same idiom as repack_fp8_tile_to_bf16 in prefill.cuh: each thread reads
-// one 16-byte chunk (16 FP8 elems) and writes two 16-byte chunks (8 x 16-bit
-// elems each). All 256 threads participate; the caller brackets this with
-// __syncthreads().
+// into the BF16 staging buffers. The per-tensor scales are NOT applied here:
+// they are algebraically moved out of this per-KV-tile hot loop — the QK side
+// folds them into Q once per Q tile (scale_q_smem) and the PV side applies
+// ckv_scale once on the fp32 o_frag epilogue. The destination uses the same
+// k128B swizzle as the 16-bit KV path, so compute_mla_qk / compute_mla_pv read
+// the staging buffers with the standard 16-bit ldmatrix logic. Same idiom as
+// repack_fp8_tile_to_bf16 in prefill.cuh: each thread reads one 16-byte chunk
+// (16 FP8 elems) and writes two 16-byte chunks (8 x 16-bit elems each). All
+// 256 threads participate; the caller brackets this with __syncthreads().
 template <typename KTraits>
 __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedStorage* smem_storage,
-                                                      const uint32_t stage_idx,
-                                                      const float ckv_scale,
-                                                      const float kpe_scale) {
+                                                      const uint32_t stage_idx) {
   using DTypeKV = typename KTraits::DTypeKV;
   using DTypeQ = typename KTraits::DTypeQ;
   static_assert(std::is_same_v<DTypeKV, __nv_fp8_e4m3>,
@@ -558,12 +565,6 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedSt
   constexpr uint32_t NUM_B128_KPE = CTA_TILE_KV * FP8_COLS_KPE;
   const uint32_t thread_id = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
 
-  using packed2_t = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, nv_bfloat162>;
-  const packed2_t ckv_scale_packed{static_cast<DTypeQ>(ckv_scale),
-                                   static_cast<DTypeQ>(ckv_scale)};
-  const packed2_t kpe_scale_packed{static_cast<DTypeQ>(kpe_scale),
-                                   static_cast<DTypeQ>(kpe_scale)};
-
   b128_t* src_ckv = (b128_t*)smem_storage->ckv_smem[stage_idx];
   b128_t* dst_ckv = (b128_t*)smem_storage->ckv_bf16_smem;
 #pragma unroll
@@ -573,10 +574,6 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedSt
         src_ckv[get_permuted_offset<KTraits::SWIZZLE_MODE_CKV, FP8_COLS_CKV>(row, col)];
     alignas(16) DTypeQ conv[16];
     vec_cast<DTypeQ, DTypeKV>::template cast<16>(conv, (DTypeKV*)&packed);
-#pragma unroll
-    for (uint32_t k = 0; k < 8; ++k) {
-      ((packed2_t*)conv)[k] = __hmul2(((packed2_t*)conv)[k], ckv_scale_packed);
-    }
     dst_ckv[get_permuted_offset<KTraits::SWIZZLE_MODE_CKV, KTraits::UPCAST_STRIDE_CKV_BF16>(
         row, 2 * col)] = *(b128_t*)&conv[0];
     dst_ckv[get_permuted_offset<KTraits::SWIZZLE_MODE_CKV, KTraits::UPCAST_STRIDE_CKV_BF16>(
@@ -594,14 +591,47 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedSt
         src_kpe[get_permuted_offset<KTraits::SWIZZLE_MODE_KPE_RAW, FP8_COLS_KPE>(row, col)];
     alignas(16) DTypeQ conv[16];
     vec_cast<DTypeQ, DTypeKV>::template cast<16>(conv, (DTypeKV*)&packed);
-#pragma unroll
-    for (uint32_t k = 0; k < 8; ++k) {
-      ((packed2_t*)conv)[k] = __hmul2(((packed2_t*)conv)[k], kpe_scale_packed);
-    }
     dst_kpe[get_permuted_offset<KTraits::SWIZZLE_MODE_KPE, KTraits::UPCAST_STRIDE_KPE_BF16>(
         row, 2 * col)] = *(b128_t*)&conv[0];
     dst_kpe[get_permuted_offset<KTraits::SWIZZLE_MODE_KPE, KTraits::UPCAST_STRIDE_KPE_BF16>(
         row, 2 * col + 1)] = *(b128_t*)&conv[8];
+  }
+}
+
+// FP8 KV path: fold the per-tensor dequant scales into Q in shared memory,
+// once per Q tile instead of per KV tile. Mathematically
+//   logits = q_nope . (ckv_scale * ckv) + q_pe . (kpe_scale * kpe)
+//          = (ckv_scale * q_nope) . ckv + (kpe_scale * q_pe) . kpe,
+// so scaling Q here makes the (scale-free) repack output feed the QK MMA with
+// identical logits. The PV side (V = ckv) gets its ckv_scale applied once on
+// the fp32 o_frag in the epilogue. A uniform per-element scale is agnostic to
+// the swizzled layout, so both buffers are walked linearly. The caller must
+// guarantee load_q's cp.async data has landed (wait + __syncthreads); the
+// first compute_mla_qk is ordered after this via the KV-loop-top
+// __syncthreads.
+template <typename KTraits>
+__device__ __forceinline__ void scale_q_smem(typename KTraits::SharedStorage* smem_storage,
+                                             const float ckv_scale, const float kpe_scale) {
+  using DTypeQ = typename KTraits::DTypeQ;
+  using packed2_t = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, nv_bfloat162>;
+  constexpr uint32_t NUM_THREADS = KTraits::NUM_THREADS;
+  constexpr uint32_t NUM_PACKED2_Q_NOPE = KTraits::CTA_TILE_Q * KTraits::HEAD_DIM_CKV / 2;
+  constexpr uint32_t NUM_PACKED2_Q_PE = KTraits::CTA_TILE_Q * KTraits::HEAD_DIM_KPE / 2;
+  const uint32_t thread_id = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
+  const packed2_t ckv_scale_packed{static_cast<DTypeQ>(ckv_scale),
+                                   static_cast<DTypeQ>(ckv_scale)};
+  const packed2_t kpe_scale_packed{static_cast<DTypeQ>(kpe_scale),
+                                   static_cast<DTypeQ>(kpe_scale)};
+
+  packed2_t* q_nope = (packed2_t*)smem_storage->q_smem_nope;
+#pragma unroll
+  for (uint32_t i = thread_id; i < NUM_PACKED2_Q_NOPE; i += NUM_THREADS) {
+    q_nope[i] = __hmul2(q_nope[i], ckv_scale_packed);
+  }
+  packed2_t* q_pe = (packed2_t*)smem_storage->q_smem_pe;
+#pragma unroll
+  for (uint32_t i = thread_id; i < NUM_PACKED2_Q_PE; i += NUM_THREADS) {
+    q_pe[i] = __hmul2(q_pe[i], kpe_scale_packed);
   }
 }
 
@@ -1088,6 +1118,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
                     q_pe + q_indptr * q_pe_stride_n, q_nope_stride_n, q_nope_stride_h,
                     q_pe_stride_n, q_pe_stride_h, qo_upperbound, qo_packed_idx_base,
                     params.num_heads);
+    if constexpr (KTraits::USE_KV_REPACK) {
+      // Commit Q's cp.async as its own group so scale_q_smem below can wait
+      // for Q alone while the KV prologue loads stay in flight. On the 16-bit
+      // path Q piggybacks on the first KV commit group as before.
+      cp_async::commit_group();
+    }
 
     if (kv_end <= kv_start) {
       cp_async::commit_group();
@@ -1133,6 +1169,27 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       }
     }
 
+    if constexpr (KTraits::USE_KV_REPACK) {
+      // Fold the dequant scales into Q once per Q tile (the repack hot loop is
+      // scale-free; see scale_q_smem). Wait until only the KV prologue groups
+      // remain in flight — Q's own group (committed right after load_q) has
+      // then landed; the KV pipeline is not drained. Groups in flight here:
+      // Q + 1 KV group, plus a 2nd KV group when kv_tile_idx >= 1 and
+      // NUM_STAGES == 2 (NUM_STAGES <= 2 is static_assert-ed for the FP8
+      // path; under NUM_STAGES == 1 both branches are safe, the else merely
+      // over-waits on dead code).
+      if (kv_tile_idx >= 1) {
+        cp_async::wait_group<NUM_STAGES>();
+      } else {
+        cp_async::wait_group<NUM_STAGES - 1>();
+      }
+      __syncthreads();
+      scale_q_smem<KTraits>(&smem_storage, variant.ckv_scale, variant.kpe_scale);
+      // No trailing barrier needed: every path to the first compute_mla_qk
+      // passes another __syncthreads (masked/no-mask loop top or the
+      // wait_group<0> barrier before the last-tiles loop).
+    }
+
     // loop with mask
 #pragma unroll 1
     for (; kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0; --kv_tile_idx) {
@@ -1144,8 +1201,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
         // __syncthreads() above guarantees (a) this tile's cp.async data is
         // visible and (b) every thread finished the previous iteration's PV
         // reads of the staging buffers, so overwriting them here is safe.
-        repack_fp8_kv_to_bf16<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant.ckv_scale,
-                                       variant.kpe_scale);
+        repack_fp8_kv_to_bf16<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES);
         __syncthreads();
         // FP8 only: QK/PV read the BF16 staging buffers, so the raw FP8 stage
         // buffer is free the instant repack finishes (the __syncthreads above
@@ -1195,8 +1251,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 
       if constexpr (KTraits::USE_KV_REPACK) {
         // See the masked loop above for the barrier reasoning.
-        repack_fp8_kv_to_bf16<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant.ckv_scale,
-                                       variant.kpe_scale);
+        repack_fp8_kv_to_bf16<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES);
         __syncthreads();
         // FP8 only: prefetch now (the raw FP8 buffer is free after repack) so
         // the cp.async overlaps this tile's QK/PV. See the masked loop above.
@@ -1236,8 +1291,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
         // barrier: wait until every thread finished the previous iteration's
         // PV reads of the staging buffers before overwriting them.
         __syncthreads();
-        repack_fp8_kv_to_bf16<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant.ckv_scale,
-                                       variant.kpe_scale);
+        repack_fp8_kv_to_bf16<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES);
         __syncthreads();
       }
       // compute mla qk
@@ -1252,6 +1306,21 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 
       // compute sfm * v
       compute_mla_pv<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag, d, o_frag);
+    }
+
+    if constexpr (KTraits::USE_KV_REPACK) {
+      // PV accumulated P * (unscaled fp8->bf16 CKV); apply the ckv dequant
+      // scale once here on the fp32 accumulator instead of per-element in the
+      // repack hot loop (also numerically better: the scale stays fp32). d is
+      // a rowsum of P and needs no scale; the QK-side scales were folded into
+      // Q (scale_q_smem), so m/d/lse are unaffected.
+#pragma unroll
+      for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 2; ++mma_d) {
+#pragma unroll
+        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+          o_frag[mma_d][reg_id] *= variant.ckv_scale;
+        }
+      }
     }
 
     __syncthreads();
