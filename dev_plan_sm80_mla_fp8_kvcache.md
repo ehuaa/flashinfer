@@ -355,6 +355,61 @@ fp8 kernel 本身 ~16% 的回退（后者只占整步 ~17% 的一小部分）。
 retract，只是次数少于 bf16，收益从"零 retract vs 大量 retract"退化为"少量 retract vs 大量
 retract"。该正式对比数据待补。
 
+#### 0.6.9 kernel 内部耗时拆解与"寄存器路径 dequant"实验（负结果，已回退）
+
+对已合入的 staging 实现（repack 到 BF16 staging，含 scale 折叠优化，0.87–0.88x）做消融拆解
+（(64,16384,128) 配置，A100，改 kernel 得到时序真实/输出作废的变体）：
+
+| 变体 | ms | 说明 |
+|---|--:|---|
+| bf16 基线 | 3.697 | |
+| fp8 staging（现行实现） | 4.229 | 0.87x |
+| − dequant ALU（repack 只搬运） | 3.925 | ALU 占 5.9% |
+| − repack 全部（留 barrier） | 3.541 | smem 搬运占 10.4% |
+| − barrier（地板） | **3.485** | **比 bf16 快 5.7%** |
+
+地板快于 bf16 说明 KV 流量减半在 A100 上有真实的小幅 memory 收益，全部被 repack 的 ~17% 税吃掉。
+据此实施了**寄存器路径 dequant 实验**（消灭 staging：QK 对 raw fp8 做 u16 视角 `ldmatrix` +
+寄存器内 `fast_dequant`（Q 侧预先做 σ 维度置换，点积对收缩维置换不变）；PV 对 raw fp8 做
+u16 `ldmatrix.trans` + PRMT 奇偶抽列 + 双 mma，epilogue 用 width-4 shuffle 恢复 o_frag 布局）。
+**功能正确**（162 FP8 + 6126 BF16 全过），smem 降到 156160/115200B（A100 可开 CTA_TILE_KV=64
+档），**但性能 0.73–0.78x，比 staging 的 0.87x 更差**，已回退（patch 存档：
+`/tmp/fp8_register_dequant_experiment.patch`）。
+
+**负结果的根因**（对后续尝试者的警示）：
+1. **转换次数翻倍**：staging 的 repack 对每个 ckv 元素只转换一次、QK/PV 共享；寄存器路径 K、V
+   各转一次（kpe 额外），总转换 ≈1.9x，还加了 PV 的 PRMT 抽列；
+2. **依赖链插在 MMA 发射前**：dequant（PRMT→LOP3→HMUL2，~10 cycle 链）紧贴每条 HMMA 的
+   B 操作数，而 kernel 寄存器已顶满 237–255（o_frag 128 个 f32 是大头），编译器没有余量做
+   软件流水把链提前；
+3. **A100 的 ALU:tensor 发射预算本来就紧**：每 k16 步 2 条 HMMA ≈16 cycle tensor 管线 vs
+   ~18 cycle 的 ALU 流——内联 ALU 无法躲进 tensor 空隙，直接拉长关键路径。
+   tier1/tier2 均测过（0.78x/0.74x），排除 tile 配置混杂。
+
+**结论**：消融地板的 1.06x 只对"零转换"成立；SM80 没有 fp8→bf16 硬件指令，转换无处可逃，
+staging 一次性转换 + 整 tile 向量化就是该架构下的合理局部最优。当前 0.87–0.88x 已接近结构性
+上限；真正消掉这笔税需要 SM89+ 的 fp8 tensor core 或 Hopper 的异步流水（见 §0.6.4）。
+
+**补充：为什么"staging 双缓冲 + repack/MMA 重叠"也不可行。** 一个自然的追问是：raw KV 已经
+双缓冲（NUM_STAGES=2），能否给 BF16 staging 也加双缓冲，让 repack(T+1) 与 compute(T) 重叠？
+答案是否定的，三层原因：
+
+1. **容量**：tier2（CTA_TILE_KV=32）现占 152064B，第二份 staging（ckv 32KB + kpe 4KB）后
+   188928B，超过 A100 每 block 上限 166912B。缩到 CTA_TILE_KV=16 能放下，但那一档
+   `QK_SHARD=false`（两个 warpgroup 重复算 QK）、tile 减半使 barrier/循环开销翻倍，先亏一截。
+2. **没有第二个执行流**：双缓冲只解决空间冲突；SM80 上 repack 没有独立执行单元，"重叠"只能
+   是同一指令流内交错发射——这正是寄存器路径实验证伪的场景（ALU 塞进 MMA 流 → 0.87x 掉到
+   0.74x），且交错 repack 比寄存器 dequant 管线压力**更大**：多出整趟 smem 搬运（LDS+2×STS，
+   占 kernel 10.4%），抢的还是 MMA 阶段 `ldmatrix` 所在的 LSU 管线；寄存器已顶满 237–255，
+   交错所需的 ~20 个临时寄存器必然 spill。瓶颈不是 buffer 不够，是没有闲置发射槽和寄存器去
+   执行被重叠的工作。
+3. **能造出第二执行流的方案都被结构堵死**：warp specialization（抽 warp 专职 repack）与
+   CTA_TILE_Q=64 要求每 warpgroup 恰好 4 warp 的 MMA tiling 冲突；warpgroup ping-pong
+   （wg0 算 tile T、wg1 repack T+1）要求每 warpgroup 独立持有全宽 512 维 o_frag = 256 个
+   f32 寄存器（现靠 PV 维度切分才压到 128 个），寄存器文件放不下。这正是 §0.6.4 的反面：
+   SM90 靠 TMA + producer/consumer warpgroup 的硬件异步机制才把 repack 藏进 WGMMA 背后，
+   SM80 没有等价物。
+
 ---
 
 ## 1. Week 1 — C++ / CUDA 基础（学习周 1）
