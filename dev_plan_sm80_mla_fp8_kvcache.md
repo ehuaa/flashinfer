@@ -18,7 +18,9 @@
   已铺好的 `ckv_scale`/`kpe_scale` 管道），实质改动集中在 `mla.cuh` + `_core.py` guard + 测试参数化。
 - **一个与最初预期相反的关键发现**：**MLA decode 是 compute-bound，不是 memory-bound**，
   所以 FP8 KV **在 A100 上不会带来 decode 加速**（实测 0.86–0.96x，即回退 4–14%），
-  即便做了"prefetch 与 QK/PV 重叠"的流水优化也只从 0.83–0.94x 抬到 0.86–0.96x。
+  即便做了"prefetch 与 QK/PV 重叠"的流水优化也只从 0.83–0.94x 抬到 0.86–0.96x；
+  后续的 scale 折叠优化（Week 3 Day 9）再收窄至 **0.87–0.88x**，消融分析（§0.6.9）表明
+  这已接近 staging 方案在 SM80 的结构性上限（寄存器路径 dequant 实验为负结果，已回退）。
   这**推翻了最初计划里"长序列 FP8 有正吞吐收益"的假设**（见 §0.6 的 roofline 分析与实测）。
 - **FP8 对 MLA 的真实价值是"KV cache 显存精确减半"**（容量翻倍 → 更大 batch / 更长 context），
   即**可行性/容量**收益：让原本 OOM 的超长 context / 超大并发能跑、同预算装更长上下文、省卡降 TP。
@@ -410,6 +412,27 @@ staging 一次性转换 + 整 tile 向量化就是该架构下的合理局部最
    SM90 靠 TMA + producer/consumer warpgroup 的硬件异步机制才把 repack 藏进 WGMMA 背后，
    SM80 没有等价物。
 
+**补充：Marlin 式 fast dequantization 在本场景的三层关系。** 有同学会问：Marlin 的
+快速反量化技巧（`vec_dtypes.cuh::fast_dequant_f8f16x4`）在我们这里用不用得上？答案分三层：
+
+1. **位操作转换本身——已经在用**。repack 的 `vec_cast<DTypeQ, DTypeKV>::cast<16>` 对
+   `vec_size % 4 == 0` 直接分发到 `fast_dequant_f8f16x4`（每 4 个 fp8：1 个 `__byte_perm`
+   重排 + 位与/移位提取符号尾数 + 2 个 `__hmul2` 乘指数 bias，~8 条指令出 4 个 bf16）。
+   SM80 没有 fp8 的硬件 `cvt`（SM89+ 才有），这就是该架构最快的软件转换路径——消融测得
+   dequant ALU 仅占 5.9%，正因为走的是它而非标量 `__nv_cvt_fp8_to_halfraw`。
+2. **"融合进 GEMM mainloop"——试过了，就是上面的寄存器路径实验（负结果）**。Marlin 的
+   杀手锏是把 dequant 内联进主循环、藏进 tensor core 的发射空隙，但其成立前提与本 kernel
+   相反：Marlin 是 memory-bound 的 W4/W8 GEMM（tensor 管线大量空闲、权重 fragment 小），
+   MLA decode 是 compute-bound（tensor 打满、o_frag 占 128 个 f32、寄存器顶格）——
+   前提不成立，融合即负收益。
+3. **"scale 融进 bias 乘法"——做了更彻底的版本**。Marlin 把 per-group scale 融进
+   fast_dequant 本来就要做的 bias `__hmul2`；本实现（scale 折叠，见 Week 3 Day 9）把
+   scale 整个挪出 repack（折进 Q + fp32 epilogue），repack 已是纯转换形态。
+   剩下唯一未榨的尾部优化：把 bias 乘法（e4m3→bf16 固定的 2^120 指数修正）也照样挪出去
+   （QK 侧拆 2^60 进 Q、2^60 进 sm_scale；PV 侧进 epilogue），预计 ~1–2%；但有数值边界
+   （Q×2^60 极端值可能溢出 bf16 上界、PV 侧 2^-120 域小值可能被 FTZ 冲掉），属于
+   "收益小、风险需论证"的 future work，暂不做。
+
 ---
 
 ## 1. Week 1 — C++ / CUDA 基础（学习周 1）
@@ -465,7 +488,15 @@ staging 一次性转换 + 整 tile 向量化就是该架构下的合理局部最
 - shared memory swizzle（k128B / k64B permuted layout）：为什么 `ldmatrix` 需要 permute
   来避免 bank conflict；
 - FP8 格式：e4m3 / e5m2 的数值范围，per-tensor 对称量化（`scale = amax / 448`），
-  `__nv_fp8_e4m3`、`vec_cast` 批量类型转换；
+  `__nv_fp8_e4m3`、`vec_cast` 批量类型转换；**Marlin 式 fast dequantization**
+  （`vec_dtypes.cuh::fast_dequant_f8f16x4`：`__byte_perm` 重排 + 位操作提取 + bias
+  `__hmul2`，SM80 无硬件 fp8 `cvt` 时的最快软件路径——repack 的 `vec_cast::cast<16>`
+  底下就是它，见 §0.6.9 的三层关系分析）；
+- **mma fragment 的 lane 级布局**（m16n8k16 的 A/B/C 各寄存器 ↔ (row, col) 映射）：
+  不只是读懂 `compute_qk_` 需要，也是评估"寄存器路径 dequant"这类改造（§0.6.9）的基础；
+  顺带理解**点积对收缩维置换不变**这一变换自由度（σ 置换技巧的数学依据）；
+- **寄存器预算意识**：`ptxas -v` 看 kernel 的 registers/spill——本 kernel o_frag 占
+  128 个 f32、总量 237–255 顶格，是否还有调度余量直接决定"能不能往 MMA 流里塞 ALU"（§0.6.9）；
 - **roofline / 算术强度（arithmetic intensity）模型**：memory-bound vs compute-bound、
   ridge point 的概念——这是判断"FP8 减半 KV 带宽到底有没有速度收益"的唯一正确工具，
   务必配合 §0.6 一起理解；
@@ -490,7 +521,11 @@ staging 一次性转换 + 整 tile 向量化就是该架构下的合理局部最
   （e4m3/e5m2 的定义与动机）；
 - [CUDA Math API 文档](https://docs.nvidia.com/cuda/cuda-math-api/) 的 FP8 部分
   （`cuda_fp8.h`：`__nv_fp8_e4m3` 类型与转换 intrinsics）；
-- 本仓库 FP8 转换实现：`include/flashinfer/vec_dtypes.cuh` 的 `vec_cast<bf16, fp8_e4m3>`；
+- 本仓库 FP8 转换实现：`include/flashinfer/vec_dtypes.cuh` 的 `vec_cast<bf16, fp8_e4m3>`
+  与 `fast_dequant_f8f16x4`（Marlin 式位操作反量化，逐行读一遍，配合
+  [MARLIN 论文 (arXiv:2408.11743)](https://arxiv.org/abs/2408.11743) 理解其原始使用场景
+  ——memory-bound 权重反量化——再对照 §0.6.9 理解为什么同一技巧在 compute-bound 的
+  MLA decode 里"转换函数用得上、mainloop 融合用不上"）；
 - **roofline 模型**：[Roofline: An Insightful Visual Performance Model (Williams et al., CACM 2009)](https://dl.acm.org/doi/10.1145/1498765.1498785)
   或任意"roofline / arithmetic intensity"入门；配合本文档 §0.6 把 GQA/MLA 各自的 AI 算一遍，
   理解"为什么同样是 FP8 KV，GQA decode 加速而 MLA decode 不加速"。
@@ -635,7 +670,10 @@ pytest tests/attention/test_deepseek_mla.py -k "not fp8" -x -q
   swizzle 冲突、smem 预算、barrier 配对等设计理由，**最重要的一份参考**）；
 - `include/flashinfer/attention/prefill.cuh` 第 1009–1042 行（`repack_fp8_tile_to_bf16`，
   SM80 上 GQA/MHA 的 FP8 dequant idiom）；
-- `tests/attention/test_deepseek_mla.py` 的 FP8 测试段（量化 helper、误差阈值的设定依据）。
+- `tests/attention/test_deepseek_mla.py` 的 FP8 测试段（量化 helper、误差阈值的设定依据）；
+- **本分支后续演进（合入后再读）**：commit 950c904d（scale 折叠：为什么 scale 能整体挪出
+  repack、Q 单独 commit group 的精确等待技巧）与 §0.6.9（消融拆解方法论 + 寄存器路径
+  dequant 负结果 + 双缓冲/Marlin 分析——一份"哪些优化方向已被定量排除"的地图）。
 
 ### Day 7：缓冲与自查
 
@@ -711,6 +749,9 @@ repack，比 Hopper 版简单。
 // 读侧：CKV 用 SWIZZLE_MODE_CKV，KPE 用 SWIZZLE_MODE_KPE_RAW（与 load_kv 写侧一致）
 ```
 
+> **后续演进**：Day 9 的 scale 折叠优化把这里的两个 `__hmul2` 从 repack 热循环整体挪走
+> （scale 折进 Q + fp32 epilogue），repack 退化为纯 `vec_cast`——见 Day 9 与 §0.6.9。
+
 ### Day 4：`compute_mla_qk()` / `compute_mla_pv()` 接 staging + P 的 DTypeQ 化
 
 - FP8 路径下 `ckv_smem` / `kpe_smem` 指向 staging buffer，stride 用 `*_BF16` 版本
@@ -763,6 +804,35 @@ repack，比 Hopper 版简单。
   无法像 SM90(warp specialization) 那样和 WGMMA 真正并行掩盖（见 §0.6）。
 - 对应 commit：`perf: overlap FP8 KV prefetch with QK/PV on SM80 MLA`。
 
+### Day 9（延伸，实际追加）：scale 折叠——把反量化 scale 挪出 repack 热循环
+
+> 消融拆解（§0.6.9）显示 repack 的 dequant ALU 占 kernel ~5.9%，其中每 tile 32×576 个元素的
+> `__hmul2` scale 乘法可被代数变换整体消掉。
+
+- **数学**：`logits = q_nope·(s_c·ckv) + q_pe·(s_k·kpe) = (s_c·q_nope)·ckv + (s_k·q_pe)·kpe`，
+  scale 折进 Q 后每个 **Q tile 只乘一次**（摊薄到全部 KV tile）；PV 侧
+  `o = P·(s_c·V) = s_c·(P·V_raw)`，`ckv_scale` 在 epilogue 的 **fp32 o_frag** 上乘一次
+  （精度反而优于 bf16 域乘法；P 是归一化概率，m/d/LSE 均不受影响）；
+- **工程点**：Q 的 cp.async 单独 `commit_group()`，用带分支的 `wait_group<N>` 精确等
+  "只剩 KV prologue 组在飞"——Q 到位即缩放，KV 预取流水不中断；
+- **踩坑**：给 `KernelTraits` 加 `static_assert(NUM_STAGES == 2)` 断得太死——tier3
+  （NUM_STAGES=1）虽然运行时不会给 FP8 派发，但模板仍会为 FP8 dtype **实例化**
+  （dispatch 宏是运行时 if），须放宽为 `<= 2`；
+- **结果**：fp8 kernel 再快 ~2%，加速比 0.86x → **0.87–0.88x**；162 FP8 + 6126 BF16 全过。
+  对应 commit：`perf: fold FP8 dequant scales into Q and fp32 epilogue on SM80 MLA`（950c904d）。
+
+### Day 10（延伸，实验，已回退）：寄存器路径 dequant——一次完整的负结果
+
+> 消融地板（去掉 repack 后 fp8 比 bf16 快 5.7%）诱使我们尝试消灭 staging：
+> QK 对 raw fp8 做 u16 视角 `ldmatrix` + 寄存器内 `fast_dequant`（Q 侧预做 σ 维度置换，
+> 利用**点积对收缩维置换不变**；K 侧每 lane 拿到 4 个连续 dim 恰好构成 σ 下的两个 B 寄存器）；
+> PV 对 raw fp8 做 u16 `ldmatrix.trans` + PRMT 奇偶抽列 + 偶/奇双 mma，epilogue 用
+> width-4 shuffle 恢复 o_frag 布局。**功能一次写对（162 FP8 + 6126 BF16 全过），
+> 但性能 0.73–0.78x < staging 的 0.87x，已回退**——根因、消融数据与双缓冲/Marlin 的
+> 系统分析见 §0.6.9；实验代码存档 `/tmp/fp8_register_dequant_experiment.patch`。
+> 教训：**动手前先用消融把"税"拆到管线粒度，并区分"消掉工作"与"搬动工作"**——
+> 地板只对前者成立。
+
 ---
 
 ## 4. Week 4 — 测试、调试、性能与提交
@@ -797,7 +867,8 @@ repack，比 Hopper 版简单。
   对照脚本另测 GQA decode；用官方 `bench_gpu_time`；
 - **最初假设（已证伪）**：以为"长 kv_len 下 FP8 省带宽 → 净收益为正"。**实测 FP8 反而回退 4–14%**
   （0.86–0.96x），因为 **MLA decode 是 compute-bound**（BF16 带宽只 ~340 GB/s，占 A100 HBM 峰值 ~17%），
-  FP8 省的带宽兑不了现，多出的 dequant 是硬开销——**完整分析与数据见 §0.6**；
+  FP8 省的带宽兑不了现，多出的 dequant 是硬开销——**完整分析与数据见 §0.6**
+  （后经 Day 9 的 scale 折叠收窄至 0.87–0.88x，且 §0.6.9 消融表明已近结构性上限）；
 - **对照实验**（关键佐证）：同机测 GQA decode（memory-bound），FP8 **加速 1.2–1.6x**、
   BF16 带宽逼近 HBM 峰值 89%，反证 MLA 的 compute-bound 特性；
 - **长序列不变性验证**：把 seq_len 扩到 32768/65536，加速比仍钉在 **0.86x**（§0.6.3），
@@ -828,6 +899,7 @@ repack，比 Hopper 版简单。
 | smem 预算算错导致 launch 失败 | `cudaFuncSetAttribute` 报错 | 以 `sizeof(SharedStorage)` 实测值核对表格 | ✅ nvcc static_assert 核验：152064/229888 精确吻合 |
 | **（新）误以为 FP8 会给 MLA decode 提速** | 目标设错、性能承诺落空 | 用 roofline 判据 + 实测校正预期 | ⚠️ 已证伪：MLA compute-bound，FP8 不提速，价值在省显存（§0.6） |
 | BF16 路径回归 | 存量用户受影响 | P→DTypeQ 等共路改动逐一论证"BF16 下数值不变"，全量回归兜底 | ✅ 1350 BF16 用例零回归 |
+| **（新）性能优化方向选错，白费工程量** | 投入大改造（如寄存器路径 dequant）却负收益 | **先消融拆解定位"税"的构成，再动手；改造以可回退方式进行** | ⚠️ 寄存器路径实验负结果（0.74x），因有消融数据与 patch 存档，半天内干净回退（§0.6.9、Week 3 Day 10） |
 
 ## 6. 验收标准（附实际达成情况）
 
@@ -858,6 +930,8 @@ repack，比 Hopper 版简单。
 - [FlashInfer (arXiv:2501.01005)](https://arxiv.org/abs/2501.01005)
 - [Roofline (Williams et al., CACM 2009)](https://dl.acm.org/doi/10.1145/1498765.1498785)
   （§0.6 判断 FP8 是否加速的模型基础）
+- [MARLIN: Mixed-Precision Auto-Regressive Parallel Inference (arXiv:2408.11743)](https://arxiv.org/abs/2408.11743)
+  （fast dequantization 与 mainloop 融合的原始场景；对照 §0.6.9 理解其前提在 MLA 下不成立）
 
 模型架构 / MLA 计算方式（§0.6 用）：
 - [DeepSeek-V2-Lite · HF](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite)（16 heads）、
@@ -884,7 +958,10 @@ repack，比 Hopper 版简单。
 - `include/flashinfer/attention/mla_hopper.cuh`（SM90 实现，含设计理由注释）
 - `include/flashinfer/attention/mla.cuh`（本次要改的 SM80 kernel）
 - `include/flashinfer/attention/prefill.cuh::repack_fp8_tile_to_bf16`（SM80 FP8 idiom）
-- `include/flashinfer/permuted_smem.cuh` / `include/flashinfer/mma.cuh` / `include/flashinfer/vec_dtypes.cuh`
+- `include/flashinfer/permuted_smem.cuh` / `include/flashinfer/mma.cuh` /
+  `include/flashinfer/vec_dtypes.cuh`（重点 `fast_dequant_f8f16x4`）
 - 本仓库 `CLAUDE.md` 与 `.claude/skills/`（JIT 开发流程、benchmark、调试教程）
 - **本项目产出**：`benchmarks/bench_deepseek_mla_fp8_kv.py`（FP8/BF16 MLA decode 对比，§0.6 数据来源）；
-  分支 `dev-plan-sm80-mla-fp8` 的 commit 序列（实现 → 测试 → 流水优化）
+  分支 `dev-plan-sm80-mla-fp8` 的 commit 序列（实现 → 测试 → 流水优化 → scale 折叠 →
+  消融拆解与负结果归档）；`/tmp/fp8_register_dequant_experiment.patch`
+  （寄存器路径 dequant 完整实现存档，含 σ 置换 / PRMT 抽列 / shuffle 重排的推导注释）
